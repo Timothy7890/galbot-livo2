@@ -8,7 +8,7 @@ const props = defineProps({
 })
 
 const RANGE = 2.5           // 显示半径 (m)
-const US_STOP = 0.3, US_SLOW = 0.5
+const US_STOP = 0.3, US_SLOW = 0.6   // 0.6 m 时 0.4 m/s 开始减速（safety.py 按速度算）
 const BASE = 0.3            // 底盘半边长 (m)，超声波装在底盘边上
 // 超声波在底盘边上的位置（按"面朝外时左/右"推定，待逐个用手遮挡确认）：[哪条边, 沿边位置 -1..1，+ 为 x 前 / y 左]
 const US_POS = {

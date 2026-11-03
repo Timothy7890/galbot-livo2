@@ -3,7 +3,8 @@
 坐标系 base_link：x 向前、y 向左、z 向上，原点在地面。底盘可全向移动，按 (vx, vy) 的方向检查：
 - Mid-360：车身沿运动方向扫过的通道内，最近障碍到车身边缘的距离 gap；
 - 超声波：朝向与运动方向夹角 60° 以内的探头读数；
-gap 小于 STOP 停车，在 STOP..SLOW 之间线性减速。原地转向时检查车身转一圈扫过的圆环。
+gap 小于 STOP 停车；否则限制速度不超过 sqrt(2·BRAKE·(gap − STOP))，即按 BRAKE 减速度刚好能在 STOP 处停下的速度：
+速度越快、离障碍越近越早减速，低速时不必在远处就慢吞吞。原地转向时检查车身转一圈扫过的圆环。
 退离障碍的方向不受限制，所以贴近后总能倒出来。
 
 车身自标定（calibrate）：周围 CAL_RADIUS 内清空后静止采几帧，始终有点的 5 cm 格子当作机器人自身
@@ -30,9 +31,9 @@ Z_MIN, Z_MAX = 0.05, 1.60   # 只看这个高度区间的点（地面以上、�
 RANGE = 3.0                 # 只保留 3 m 内的点
 SIDE_MARGIN = 0.05          # 运动通道比车身两侧各宽这么多
 
-# 0.15 m/s 时按 0.8 m/s² 减速只需约 1.5 cm 就能停下，减速带不必太宽，太宽会在杂物多的地方一直慢吞吞
-LIDAR_STOP, LIDAR_SLOW = 0.25, 0.50     # m，障碍到车身边缘
-US_STOP, US_SLOW = 0.30, 0.50           # m，超声波读数
+LIDAR_STOP = 0.25                       # m，障碍到车身边缘小于此值停车
+US_STOP = 0.30                          # m，超声波读数小于此值停车
+BRAKE = 0.3                             # 计算允许速度用的减速度 (m/s²)，比 7011 实际减速度 0.8 保守，留出延迟余量
 US_MAX_VALID = 4.0                      # 超过视为无回波
 ROT_STOP, ROT_SLOW = 0.08, 0.25         # 原地转向：车身扫过圆外的余量
 US_ROT_STOP = 0.15                      # 原地转向：任一超声波小于此值不允许转
@@ -50,6 +51,11 @@ ULTRASONIC = {
 
 def ramp(gap, stop, slow):
     return float(np.clip((gap - stop) / (slow - stop), 0.0, 1.0))
+
+
+def v_allow(gap, stop):
+    """离障碍 gap 时允许的最大速度：按 BRAKE 减速能在 stop 处停下。"""
+    return math.sqrt(2 * BRAKE * (gap - stop)) if gap > stop else 0.0
 
 
 def cell_keys(xy):
@@ -179,10 +185,10 @@ class Safety:
             u = np.array([vx, vy]) / v
             lg = self.lidar_gap(u)
             ug, uk = self.us_gap(u)
-            lin_scale = min(ramp(lg, LIDAR_STOP, LIDAR_SLOW), ramp(ug, US_STOP, US_SLOW))
+            va_l, va_u = v_allow(lg, LIDAR_STOP), v_allow(ug, US_STOP)
+            lin_scale = min(1.0, min(va_l, va_u) / v)
             if lin_scale < 1:
-                src = f"雷达 {lg:.2f} m" if ramp(lg, LIDAR_STOP, LIDAR_SLOW) <= ramp(ug, US_STOP, US_SLOW) \
-                    else f"超声波{ULTRASONIC[uk][1]} {ug:.2f} m"
+                src = f"雷达 {lg:.2f} m" if va_l <= va_u else f"超声波{ULTRASONIC[uk][1]} {ug:.2f} m"
                 reasons.append(f"{'停止' if lin_scale == 0 else '减速'}：运动方向障碍（{src}）")
 
         rot_scale = 1.0

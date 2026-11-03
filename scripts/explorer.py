@@ -47,11 +47,11 @@ from safety import Safety      # noqa: E402
 
 TELEOP = "http://127.0.0.1:7011/api/cmd"
 PORT = 7013
-V_MAX = float(os.environ.get("EXPLORE_V", "0.15"))     # m/s，实测合适
-W_MAX = float(os.environ.get("EXPLORE_W", "0.4"))      # rad/s
+V_MAX = float(os.environ.get("EXPLORE_V", "0.4"))      # m/s
+W_MAX = float(os.environ.get("EXPLORE_W", "0.8"))      # rad/s
 TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60    # 每次进入自主建图的时长上限
 STOP_COUNTDOWN = 120        # 完成后这么久没人取消就停止录制 (s)
-LOOKAHEAD = 0.9             # 纯追踪前视距离 (m)：路线已拉直，看远一点走得更稳
+LOOKAHEAD = max(0.9, 3.0 * V_MAX)   # 纯追踪前视距离 (m)：约 3 s 的行程，速度越快看得越远，走得越稳
 TURN_IN, TURN_OUT = math.radians(60), math.radians(20)   # 前视点偏离车头超过 60° 原地转，转到 20° 内再走（滞回，避免走走停停）
 SLOW_ANGLE = math.radians(25)       # 偏离 25° 以内全速
 ARRIVE = 0.3                # 到达目标的距离 (m)
@@ -310,7 +310,7 @@ class Explorer:
         if self.turning:
             return 0.0, 0.0, wz
         dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
-        v = V_MAX * max(0.4, min(1.0, dist / 0.6))
+        v = V_MAX * max(0.3, min(1.0, dist / (2.5 * V_MAX)))    # 接近目标时减速
         if abs(alpha) > SLOW_ANGLE:
             v *= math.cos(alpha)
         n = math.hypot(bx, by)
