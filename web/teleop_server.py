@@ -13,7 +13,9 @@
     POST /api/calibrate     车身自标定：静止采 CAL_FRAMES 帧 Mid-360，记录机器人自身（手臂等），见 safety.py
 
 安全：
-- 发给底盘的每条指令只持续 CMD_DURATION 秒，超时底盘自己停；
+- 速度以 duration=0 下发（不阻塞）。SDK 的 set_base_velocity 带 duration 时会阻塞整个时长且不释放 GIL，
+  整个进程都会卡住（实测 duration 0.5 → 520 ms），所以不用它的自动停车，而是：
+  本服务 10 Hz 持续下发；另有看门狗进程 base_watchdog.py 读心跳文件，本服务崩溃或卡住超过 0.6 s 时由它 stop_base；
 - 本服务 HEARTBEAT 秒内没收到新指令（松手、网页断线、网络卡顿）按 DEC 减速到 0，超过 HALT_AFTER 立即 stop_base；
 - 输出按 ACC / DEC 限制加减速，起停平顺；避障要求停车时立即停；
 - safe=true 经 safety.py（Mid-360 + 超声波）按运动方向限速/停车后再下发，false 直接下发（无避障）。
@@ -37,7 +39,7 @@ from webcommon import BaseHandler
 PORT = int(os.environ.get("TELEOP_WEB_PORT", "7011"))
 MAX_V = 0.5          # m/s
 MAX_W = 1.0          # rad/s
-CMD_DURATION = 0.5   # 每条指令在底盘侧的持续时间 (s)
+HEARTBEAT_FILE = "/dev/shm/galbot_teleop_heartbeat"     # "时间戳 是否在动"，base_watchdog.py 读
 HEARTBEAT = 0.5      # 超过这么久没收到新指令就减速停车 (s)；网页经热点遥控时包间隔抖动大，太短会一顿一顿
 HALT_AFTER = 1.0     # 超过这么久没收到新指令立即 stop_base (s)
 ACC_V, DEC_V = 0.4, 0.8     # 线加速度、减速度 (m/s²)
@@ -46,6 +48,17 @@ RATE = 10            # 下发频率 (Hz)
 CAL_FRAMES = 20      # 车身自标定采集帧数（约 2 s）
 CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
+
+
+def beat(moving):
+    """写心跳（原子替换），看门狗据此判断本服务是否还在正常控制底盘。"""
+    tmp = HEARTBEAT_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(f"{time.time():.3f} {1 if moving else 0}")
+        os.replace(tmp, HEARTBEAT_FILE)
+    except OSError:
+        pass
 
 
 class Base:
@@ -155,6 +168,7 @@ class Base:
         self.moving = False
         self.applied = (0.0, 0.0, 0.0)
         self.last_result = why
+        beat(False)
 
     def sender(self):
         """下发线程：把 loop 算好的最新速度发给底盘。SDK 调用慢时只会少发几次中间值，不会积压。"""
@@ -173,12 +187,13 @@ class Base:
                 t0 = time.perf_counter()
                 try:
                     if any(out):
-                        self.robot.set_base_velocity([out[0], out[1], 0.0], [0.0, 0.0, out[2]], CMD_DURATION)
+                        self.robot.set_base_velocity([out[0], out[1], 0.0], [0.0, 0.0, out[2]], 0.0)
                     else:
                         self.robot.stop_base()
                 except Exception as e:      # noqa: BLE001
                     self.last_result = f"底盘调用异常：{e}"
                 self.sdk_ms.append((time.perf_counter() - t0) * 1000)
+                beat(any(out))
 
     def _read_sensors(self):
         """每个周期读一次 Mid-360 和超声波，喂给避障。"""

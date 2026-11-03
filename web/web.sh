@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# 网页服务：7010 录制（server.py）+ 7011 底盘遥控（teleop_server.py，需在 Galbot SDK 环境下运行）
+# 网页服务：7010 录制（server.py）+ 7011 底盘遥控（teleop_server.py）+ 底盘看门狗（base_watchdog.py）
+# 后两者需在 Galbot SDK 环境下运行
 # 用法: web/web.sh start | stop | restart | status | autostart
 WEB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUN_DIR=$WEB_DIR/../run
 mkdir -p "$RUN_DIR"
 
 # 名称 脚本 端口 [是否需要 SDK 环境]
-SERVERS=("web server.py 7010" "teleop teleop_server.py 7011 sdk")
+SERVERS=("web server.py 7010" "teleop teleop_server.py 7011 sdk" "watchdog base_watchdog.py - sdk")
 SDK_ENV=$WEB_DIR/../catkin_ws/src/galbot_livo2/scripts/sdk_env.sh
 
 running() { [[ -f $RUN_DIR/$1.pid ]] && kill -0 "$(cat "$RUN_DIR/$1.pid")" 2> /dev/null; }
