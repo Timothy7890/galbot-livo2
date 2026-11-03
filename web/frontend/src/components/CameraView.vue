@@ -1,11 +1,12 @@
 <script setup>
-// 4 路环视相机：录制中显示 2x2 预览（320x240，每 0.5 s 一帧），点击某一路放大看原图
+// 4 路环视相机：active 时显示 2x2 预览（320x240，每 0.5 s 一帧），点击某一路放大看原图
 import { onUnmounted, reactive, ref, watch } from 'vue'
 import { cameraUrl } from '../api.js'
 
 const props = defineProps({
-  recording: Boolean,
-  mainCamera: { type: String, default: 'left_front' },
+  active: Boolean,
+  mainCamera: { type: String, default: '' },
+  idleText: { type: String, default: '录制中显示' },
 })
 
 const CAMERAS = [
@@ -34,7 +35,7 @@ function stopAll() {
   for (const name in timers) clearTimeout(timers[name])
 }
 
-watch(() => props.recording, rec => {
+watch(() => props.active, rec => {
   stopAll()
   if (rec) CAMERAS.forEach(([name]) => poll(name))
   else {
@@ -55,7 +56,7 @@ function toggle(name) {
       环视相机
       <span class="muted hint-text">{{ zoomed ? '点击画面返回四路' : '点击某一路放大' }}</span>
     </div>
-    <div v-if="!recording" class="frame empty muted">录制中显示</div>
+    <div v-if="!active" class="frame empty muted">{{ idleText }}</div>
     <div v-else-if="zoomed" class="frame" @click="toggle(zoomed)">
       <img v-if="src[zoomed]" :src="src[zoomed]" alt="" />
       <span class="label">{{ CAMERAS.find(c => c[0] === zoomed)[1] }}<b v-if="zoomed === mainCamera"> · 主相机</b></span>

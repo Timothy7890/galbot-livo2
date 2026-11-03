@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# 网页服务：7010 录制（server.py）
+# 网页服务：7010 录制（server.py）+ 7011 底盘遥控（teleop_server.py，需在 Galbot SDK 环境下运行）
 # 用法: web/web.sh start | stop | restart | status | autostart
 WEB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUN_DIR=$WEB_DIR/../run
 mkdir -p "$RUN_DIR"
 
-# 名称 脚本 端口
-SERVERS=("web server.py 7010")
+# 名称 脚本 端口 [是否需要 SDK 环境]
+SERVERS=("web server.py 7010" "teleop teleop_server.py 7011 sdk")
+SDK_ENV=$WEB_DIR/../catkin_ws/src/galbot_livo2/scripts/sdk_env.sh
 
 running() { [[ -f $RUN_DIR/$1.pid ]] && kill -0 "$(cat "$RUN_DIR/$1.pid")" 2> /dev/null; }
 
 start_one() {
-    local name=$1 script=$2 port=$3
+    local name=$1 script=$2 port=$3 prefix=()
+    [[ ${4:-} == sdk ]] && prefix=("$SDK_ENV")
     if running "$name"; then echo "$script 已在运行，端口 $port"; return 0; fi
-    setsid /usr/bin/python3 "$WEB_DIR/$script" >> "$RUN_DIR/$name.log" 2>&1 < /dev/null &
+    setsid "${prefix[@]}" /usr/bin/python3 "$WEB_DIR/$script" >> "$RUN_DIR/$name.log" 2>&1 < /dev/null &
     echo $! > "$RUN_DIR/$name.pid"
     sleep 1
     if running "$name"; then echo "$script 已启动，端口 $port"; else echo "$script 启动失败，见 run/$name.log"; return 1; fi

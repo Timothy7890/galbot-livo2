@@ -38,7 +38,7 @@ roslaunch galbot_livo2 mapping.launch
 ## 录制网页（7010）
 
 ```bash
-web/web.sh start       # 启动网页服务；web/web.sh autostart 设为开机自启
+web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh autostart 设为开机自启（已设置）
 ```
 
 浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制、实时俯视地图（1.6 m 以下的点，按高度着色）、主相机画面、历史记录。
@@ -48,3 +48,11 @@ web/web.sh start       # 启动网页服务；web/web.sh autostart 设为开机�
 - `map.pcd`（5 cm 降采样彩色地图）、`map_raw.pcd`、`trajectory.csv`、`lidar_poses.txt`、`config/`、`logs/`、`info.txt`
 
 前端改动后在有 node 的机器上 `cd web/frontend && npm install && npm run build`，把 `web/dist` 一起提交。
+
+## 底盘遥控网页（7011）
+
+浏览器打开 `http://<HPU>:7011`（本机经 ssh 转发为 17711）。按住按钮或键盘 W/S 前后、A/D 横移、Q/E 转向，空格急停。
+
+- 默认经 `navigate_with_velocity` 下发，开启 Galbot 的碰撞检测；可关闭改用 `set_base_velocity`（无避障，需确认）
+- 每条指令只持续 0.5 s；服务端 0.35 s 内没收到新指令（松手、切走页面、断线）立即 `stop_base`
+- 急停会锁定，解除前忽略一切速度指令；默认限速 0.5 m/s、1.0 rad/s（`web/teleop_server.py`）
