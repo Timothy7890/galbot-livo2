@@ -5,8 +5,9 @@ const props = defineProps({
   status: { type: Object, required: true },
   pending: { type: String, default: '' },
   actionError: { type: String, default: '' },
+  explore: { type: Object, default: null },     // 录制中 explorer.py 的状态
 })
-defineEmits(['start', 'explore', 'stop'])
+defineEmits(['start', 'toggle-explore', 'stop'])
 
 const LABEL = {
   connecting: '连接中…',
@@ -54,8 +55,10 @@ const hms = s => [s / 3600, (s / 60) % 60, s % 60].map(v => String(Math.floor(v)
       <button class="go" :disabled="!canStart" @click="$emit('start')">开始录制</button>
       <button class="stop" :disabled="!canStop" @click="$emit('stop')">停止录制</button>
     </div>
-    <button class="explore" :disabled="!canStart" @click="$emit('explore')">自主建图（机器人自己走）</button>
-    <div v-if="status.mode === 'explore' && state === 'recording'" class="meta muted">模式：自主探索</div>
+    <button class="explore" :class="{ on: explore?.enabled }" :disabled="state !== 'recording' || !explore"
+            @click="$emit('toggle-explore')">
+      {{ explore?.enabled ? '退出自主建图' : '进入自主建图（机器人自己走）' }}
+    </button>
     <div v-if="status.session" class="meta muted">
       保存到 {{ status.session }}<template v-if="status.size">（{{ status.size }}）</template>
     </div>
@@ -80,6 +83,7 @@ button:disabled { opacity: 0.35; cursor: default; }
 .go { background: var(--go); }
 .stop { background: var(--stop); }
 .explore { background: #2563eb; width: 100%; margin-top: 10px; flex: none; }
+.explore.on { background: var(--warn); }
 .meta { font-size: 12px; margin-top: 10px; word-break: break-all; }
 .err { color: var(--stop); font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
 </style>

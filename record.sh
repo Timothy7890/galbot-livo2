@@ -3,8 +3,8 @@
 #  Galbot G1 录制 + FAST-LIVO2 实时建图（传感器经 Galbot SDK 读取，不停用 Galbot 服务）
 #
 #  用法:
-#    ./record.sh start              开始录制（手动或遥控开车）
-#    ./record.sh start --explore    开始录制并自主探索：机器人自己走遍场地，回到起点后自动停止录制
+#    ./record.sh start              开始录制。录制期间可在 7010 页面随时进入 / 退出自主建图
+#    ./record.sh start --explore    开始录制并立即进入自主建图
 #                                   （底盘经 7011 遥控服务控制，需 web/web.sh 已启动；
 #                                     EXPLORE_V / EXPLORE_W / EXPLORE_MINUTES 可改限速与时长上限）
 #    ./record.sh stop     停止录制，保存地图、轨迹、原始包
@@ -13,7 +13,7 @@
 #  每次录制输出到 $DATA_ROOT/<开始时间>/:
 #    raw.bag         Mid-360 点云与 IMU、4 路环视相机 JPEG（供 3DGS 等离线处理）
 #    map.pcd         FAST-LIVO2 彩色地图（降采样）   map_raw.pcd  未降采样
-#    explore.json  explore_grid.png  自主探索的过程记录与 2D 栅格（--explore 时）
+#    explore.json  explore_grid.png  2D 栅格与自主建图的过程记录
 #    trajectory.csv  FAST-LIVO2 位姿（IMU 系，10 Hz 以上）   lidar_poses.txt  FAST-LIVO2 原始输出
 #    config/  logs/  info.txt
 # ============================================================================
@@ -151,7 +151,7 @@ cmd_start() {
         exit 1
     fi
     if $explore && ! python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7011/api/status', timeout=5)" 2>/dev/null; then
-        echo "7011 底盘遥控服务未运行，无法自主探索（web/web.sh start）" >&2
+        echo "7011 底盘遥控服务未运行，无法自主建图（web/web.sh start）" >&2
         exit 1
     fi
     if [[ ! -f $PKG_DIR/config/g1_calib.yaml ]]; then
@@ -168,7 +168,6 @@ cmd_start() {
     state_set status starting
     state_set session "$SESSION"
     state_set started "$(date +%s)"
-    state_set mode "$($explore && echo explore || echo manual)"
     log "录制目录: $SESSION"
 
     fail() {
@@ -210,10 +209,9 @@ cmd_start() {
     for c in "${CAMERAS[@]}"; do topics+=("/galbot/$c/image/compressed"); done
     launch rosbag rosbag record -O "$SESSION/raw.bag" "${topics[@]}"
 
-    if $explore; then
-        log "启动自主探索"
-        launch explorer python3 "$PROJECT_DIR/scripts/explorer.py" "_session:=$SESSION"
-    fi
+    # 自主建图程序随录制启动：平时只建 2D 栅格，进入自主建图后才控制底盘
+    log "启动自主建图程序$($explore && echo "（立即进入）")"
+    launch explorer python3 "$PROJECT_DIR/scripts/explorer.py" "_session:=$SESSION" "_auto_start:=$explore"
 
     state_set status recording
     log "录制中。停止请运行: $0 stop"
@@ -256,7 +254,6 @@ duration_s=$((end - started))
 bag_size=${bag_size:-无}
 map_points=${points:-0}
 trajectory_poses=$traj_rows
-mode=$(state_get mode)
 EOF
     rm -f "$STATE_FILE"
     log "已保存到 $SESSION"
@@ -282,7 +279,6 @@ cmd_status() {
     echo "status=$status"
     echo "session=$session"
     echo "elapsed_s=$((now - started))"
-    echo "mode=$(state_get mode)"
     echo "size=$(du -sh "$session" 2>/dev/null | cut -f1)"
 }
 

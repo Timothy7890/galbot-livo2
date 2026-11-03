@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, onUnmounted, ref, computed } from 'vue'
-import { getExplore, getStatus, startRecording, stopRecording } from './api.js'
+import { exploreAction, getExplore, getStatus, startRecording, stopRecording } from './api.js'
 import RecordPanel from './components/RecordPanel.vue'
 import LiveMap from './components/LiveMap.vue'
 import SessionList from './components/SessionList.vue'
@@ -14,8 +14,7 @@ let timer = null
 let exploreTimer = null
 
 const recording = computed(() => status.value.status === 'recording')
-const exploring = computed(() => recording.value && status.value.mode === 'explore')
-const explore = ref(null)     // 自主探索状态（explorer.py）
+const explore = ref(null)     // 录制中 explorer.py 的状态（自主建图）
 
 async function refresh() {
   try {
@@ -25,24 +24,40 @@ async function refresh() {
   }
 }
 
-// 自主探索状态单独每秒刷新一次（录制状态 2 s 一次即可）
+// 自主建图状态单独每秒刷新一次（录制状态 2 s 一次即可）
 async function refreshExplore() {
-  if (!exploring.value) return
-  try { explore.value = await getExplore() } catch { /* 探索进程刚启动或已结束 */ }
+  if (!recording.value) { explore.value = null; return }
+  try { explore.value = await getExplore() } catch { /* 刚开始录制，程序还没就绪 */ }
 }
 
-async function onExplore() {
-  if (!confirm('自主建图：机器人会自己移动，走遍整个场地后回到起点并自动停止录制。\n\n' +
-    '· 请确认周围没有人和易碎物品，场地出口已关闭\n· 随时可在 7011 遥控页按急停（暂停探索）或在此停止录制\n\n开始？')) return
-  onStart(true)
+async function onToggleExplore() {
+  const enabled = explore.value?.enabled
+  if (!enabled && !confirm('进入自主建图：机器人会自己移动，走遍场地后回到录制起点；' +
+    '之后 2 分钟内没人取消就自动停止录制。\n\n' +
+    '· 请确认周围没有人和易碎物品，场地出口已关闭\n' +
+    '· 随时可点「退出自主建图」，或在 7011 遥控页按急停（暂停）/ 按方向键（人工接管，自动退出）\n\n进入？')) return
+  actionError.value = ''
+  try {
+    const r = await exploreAction(enabled ? 'disable' : 'enable')
+    if (!r.ok) actionError.value = r.msg
+  } catch (e) {
+    actionError.value = String(e)
+  }
+  refreshExplore()
 }
 
-async function onStart(withExplore = false) {
+async function onCancelStop() {
+  const r = await exploreAction('cancel')
+  if (!r.ok) actionError.value = r.msg
+  refreshExplore()
+}
+
+async function onStart() {
   pending.value = 'starting'
   actionError.value = ''
   explore.value = null
   try {
-    const r = await startRecording(withExplore === true)
+    const r = await startRecording()
     if (!r.ok) actionError.value = r.msg
   } catch (e) {
     actionError.value = String(e)
@@ -86,14 +101,15 @@ onUnmounted(() => { clearInterval(timer); clearInterval(exploreTimer) })
       :pending="pending"
       :action-error="actionError"
       @start="onStart"
-      @explore="onExplore"
+      :explore="explore"
+      @toggle-explore="onToggleExplore"
       @stop="onStop"
     />
-    <ExplorePanel v-if="exploring || explore" class="exp" :explore="explore" :active="exploring" />
+    <ExplorePanel v-if="recording" class="exp" :explore="explore" @cancel-stop="onCancelStop" />
     <CameraView class="cam" :active="recording" :main-camera="status.main_camera" />
     <SessionList class="list" :sessions="status.sessions || []" :data-root="status.data_root" />
     <section class="map">
-      <LiveMap :recording="recording" :explore="exploring ? explore : null" />
+      <LiveMap :recording="recording" :explore="recording ? explore : null" />
     </section>
   </main>
 </template>

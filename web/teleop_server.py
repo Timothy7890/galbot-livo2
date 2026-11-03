@@ -6,7 +6,8 @@
     GET  /api/scan          避障用的障碍点、8 个超声波读数、限速明细（网页俯视图）
     GET  /api/camera/<名称>.jpg  环视相机最新画面（默认 320x240 预览，?full=1 原图）
     POST /api/cmd           {"vx", "vy", "wz", "safe", "source"} 速度指令，网页按住期间、自主探索（explorer.py）运行期间
-                            每 0.1 s 发一次；返回上一周期实际下发的速度和避障原因。底盘只由本服务控制，急停对两者都有效
+                            每 0.1 s 发一次；返回上一周期实际下发的速度、避障原因和其他来源最近一次指令距今多久
+                            （others，自主探索据此判断人工接管）。底盘只由本服务控制，急停对两者都有效
     POST /api/stop          急停（锁定，之后的速度指令一律忽略）
     POST /api/release       解除急停
     POST /api/calibrate     车身自标定：静止采 CAL_FRAMES 帧 Mid-360，记录机器人自身（手臂等），见 safety.py
@@ -65,6 +66,7 @@ class Base:
         self.lidar_stamp = 0
         self.applied = (0.0, 0.0, 0.0)  # 限速后实际下发的速度
         self.calib = None           # 车身自标定进行中时为已采集的帧列表
+        self.last_by_source = {}    # 来源 -> 最近一次非零指令的时间
         self.calib_msg = ""
 
     def ensure_sdk(self):
@@ -102,9 +104,15 @@ class Base:
                 return False, "急停中，请先解除"
             if self.calib is not None:
                 return False, "车身标定中，请稍候"
-            self.target = (clamp(vx, MAX_V), clamp(vy, MAX_V), clamp(wz, MAX_W), bool(safe), time.time(),
-                           str(source)[:16])
+            now = time.time()
+            self.target = (clamp(vx, MAX_V), clamp(vy, MAX_V), clamp(wz, MAX_W), bool(safe), now, str(source)[:16])
+            if any(self.target[:3]):
+                self.last_by_source[self.target[5]] = now
         return True, ""
+
+    def others(self, source):
+        now = time.time()
+        return {k: round(now - t, 2) for k, t in self.last_by_source.items() if k != source}
 
     def stop(self, latch=False):
         with self.lock:
@@ -297,7 +305,8 @@ class Handler(BaseHandler):
             except (TypeError, ValueError):
                 ok, msg = False, "参数错误"
             self.send(200 if ok else 409, {"ok": ok, "msg": msg, "estop": base.estop, "applied": base.applied,
-                                           "result": base.last_result, "limit": base.safety.last})
+                                           "result": base.last_result, "limit": base.safety.last,
+                                           "others": base.others(str(b.get("source", "web"))[:16])})
         elif self.path == "/api/stop":
             base.stop(latch=True)
             self.send(200, {"ok": True})

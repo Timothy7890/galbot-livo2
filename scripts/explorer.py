@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""自主探索（由 record.sh start --explore 随录制启动）：从零开始把封闭场地走一遍，建完图回到起点并结束录制。
+"""自主建图（随每次录制由 record.sh 启动）：录制期间一直建 2D 栅格；进入自主建图后机器人自己走遍封闭场地。
 
     FAST-LIVO2 位姿 /aft_mapped_to_init + Mid-360 /livox/lidar → explore_grid.Grid（2D 占据栅格）
-    → 每秒找一次边界、选目标、A* 规划 → 10 Hz 跟随路径 → 速度发给 7011 遥控服务 /api/cmd
+    → 每秒找一次边界、选目标、规划路径 → 10 Hz 跟随路径 → 速度发给 7011 遥控服务 /api/cmd
 
-底盘只由 7011（web/teleop_server.py）控制：避障（Mid-360 + 超声波）、加减速限制、心跳停车、急停都在那里，
-网页上的急停对自主探索同样有效（急停期间暂停，解除后继续）。
+底盘只由 7011（web/teleop_server.py）控制：避障（Mid-360 + 超声波）、加减速限制、心跳停车、急停都在那里。
 
-流程：原地转一圈 → 循环（选边界 → 前往）→ 没有可去的边界或超时 → 回到起点 → 停止录制。
-卡住（一段时间几乎没动或一直被避障挡住）：后退一点、把目标拉黑、换下一个。
-位姿中断则暂停；位姿跳变（定位跑飞）则停止探索并报警，录制保留。
+状态：
+    idle      录制中、未进入自主建图：只建栅格，不发任何速度
+    spin      刚进入（本次录制第一次）：原地转一圈看清四周
+    explore   选最近、最大的边界（已知可通行与未知的交界）前往
+    home      没有可去的边界或超过时长上限：返回录制起点
+    countdown 已回到起点、退出自主建图：STOP_COUNTDOWN 秒内没人取消就停止录制
+    error     位姿跳变（定位跑飞）等，已退出自主建图，可检查后重新进入
 
-状态在 http://127.0.0.1:7013/state（JSON）与 /grid.png（栅格图），由 web/server.py 转发给 7010 页面。
+进入 / 退出 / 取消停止：POST /enable、/disable、/cancel（web/server.py 转发自 7010 页面）。
+7011 上有人按方向键（人工接管）立即退出自主建图；7011 急停期间暂停，解除后继续。
+卡住（一段时间几乎没动或一直被避障挡住）：后退一点、把目标拉黑、换下一个。位姿中断则暂停。
+
+状态在 http://127.0.0.1:7013/state（JSON）与 /grid.png（栅格图）。
 """
 import json
 import math
@@ -41,7 +48,8 @@ TELEOP = "http://127.0.0.1:7011/api/cmd"
 PORT = 7013
 V_MAX = float(os.environ.get("EXPLORE_V", "0.15"))     # m/s，实测合适
 W_MAX = float(os.environ.get("EXPLORE_W", "0.4"))      # rad/s
-TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60
+TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60    # 每次进入自主建图的时长上限
+STOP_COUNTDOWN = 120        # 完成后这么久没人取消就停止录制 (s)
 LOOKAHEAD = 0.6             # 纯追踪前视距离 (m)
 TURN_IN_PLACE = math.radians(50)    # 前视点偏离车头超过此角度先原地转
 ARRIVE = 0.3                # 到达目标的距离 (m)
@@ -50,6 +58,7 @@ STUCK_TIME, STUCK_DIST = 8.0, 0.05  # 这么久内移动不到这么远算卡住
 BLOCKED_TIME = 4.0          # 一直被避障挡住这么久算卡住
 BACKOFF_TIME, BACKOFF_V = 1.5, 0.1  # 卡住后反向退开
 POSE_STALE, POSE_JUMP = 0.5, 0.3    # 位姿超过 0.5 s 没更新暂停；相邻两帧跳变超过 0.3 m 视为定位跑飞
+TAKEOVER = 0.5              # 7011 这么久内收到过网页的指令，视为人工接管 (s)
 SCAN_EVERY = 2              # 每 2 帧点云更新一次栅格（5 Hz）
 DRY_RUN = os.environ.get("EXPLORE_DRY_RUN") == "1"   # 只算不动：不向 7011 发速度，用于检查流程
 
@@ -75,6 +84,7 @@ class Explorer:
         self.T_b_l = self.T_b_i.copy()
         self.T_b_l[:3, 3] = self.T_b_i[:3, :3] @ self.t_i_l + self.T_b_i[:3, 3]
         self.session = rospy.get_param("~session", "")
+        self.auto_start = rospy.get_param("~auto_start", False)   # record.sh start --explore：一就绪就进入
         self.safety = Safety()      # 只用它的车身轮廓与自标定结果过滤机器人自身的点
 
         self.lock = threading.Lock()
@@ -82,12 +92,15 @@ class Explorer:
         self.T_w_i = None           # 最新 IMU 位姿
         self.pose_t = 0.0
         self.pose = None            # 底盘 (x, y, yaw)
-        self.home = None
+        self.home = None            # 录制起点
         self.scan_n = 0
 
-        self.state = "starting"     # spin / explore / backoff / home / paused / done / error
+        self.state = "idle"
         self.msg = "等待 FAST-LIVO2 位姿"
-        self.t_start = time.time()
+        self.enabled = False        # 是否处于自主建图（由本程序发速度）
+        self.spun = False           # 本次录制是否已环视过
+        self.t_enter = 0.0
+        self.stop_at = None         # 倒计时结束时间
         self.goal = None            # 世界坐标 (x, y)
         self.path = []              # 世界坐标 [(x, y)]
         self.frontiers = []
@@ -108,13 +121,14 @@ class Explorer:
         T_w_b = T @ self.T_i_b
         pose = (T_w_b[0, 3], T_w_b[1, 3], math.atan2(T_w_b[1, 0], T_w_b[0, 0]))
         with self.lock:
-            if self.pose is not None and math.hypot(pose[0] - self.pose[0], pose[1] - self.pose[1]) > POSE_JUMP:
-                self.fail(f"FAST-LIVO2 位姿跳变 {math.hypot(pose[0] - self.pose[0], pose[1] - self.pose[1]):.2f} m，"
-                          "疑似定位跑飞，已停止探索（录制继续，可手动停止）")
+            jump = math.hypot(pose[0] - self.pose[0], pose[1] - self.pose[1]) if self.pose else 0.0
+            if jump > POSE_JUMP and self.enabled:
+                self.fail(f"FAST-LIVO2 位姿跳变 {jump:.2f} m，疑似定位跑飞，已退出自主建图（录制继续）")
             self.T_w_i, self.pose, self.pose_t = T, pose, time.time()
             if self.grid is None:
                 self.grid = eg.Grid(floor_z=T_w_b[2, 3])        # base_link 原点在地面
                 self.home = pose[:2]
+                self.msg = "录制中，可进入自主建图"
 
     def on_cloud(self, msg):
         self.scan_n += 1
@@ -135,9 +149,51 @@ class Explorer:
         T_w_b = T @ self.T_i_b
         grid.mark_free_disk(T_w_b[:2, 3])
 
+    # ------------------------------------------------------------ 进入 / 退出 / 取消停止（网页调用）
+    def enable(self):
+        with self.lock:
+            if self.pose is None:
+                return False, "FAST-LIVO2 还没输出位姿，请稍候"
+            if self.enabled:
+                return False, "已在自主建图中"
+            self.enabled, self.stop_at, self.going_home = True, None, False
+            self.goal, self.path, self.blacklist = None, [], []
+            self.t_enter = time.time()
+            self.state = "explore" if self.spun else "spin"
+            self.msg = "开始探索" if self.spun else "原地转一圈，先看清四周"
+        rospy.loginfo("进入自主建图")
+        return True, "已进入自主建图"
+
+    def disable(self, why="已退出自主建图", stop_robot=True):
+        with self.lock:
+            if not self.enabled:
+                return False, "未在自主建图中"
+            was = self.enabled
+            self.enabled = False
+            self.goal, self.path = None, []
+            if self.state != "error":
+                self.state, self.msg = "idle", why
+        if was and stop_robot:
+            self.send(0, 0, 0)
+        rospy.loginfo(why)
+        return True, why
+
+    def cancel_stop(self):
+        with self.lock:
+            if self.stop_at is None:
+                return False, "没有在倒计时"
+            self.stop_at, self.state, self.msg = None, "idle", "已取消自动停止，录制继续"
+        return True, self.msg
+
+    def fail(self, why):
+        """调用方需持有 self.lock。"""
+        self.enabled, self.goal, self.path = False, None, []
+        self.state, self.msg = "error", why
+        rospy.logerr(why)
+
     # ------------------------------------------------------------ 规划（后台线程）
     def plan_loop(self):
-        while not rospy.is_shutdown() and self.state not in ("done", "error"):
+        while not rospy.is_shutdown():
             t0 = time.time()
             try:
                 self.replan()
@@ -147,7 +203,7 @@ class Explorer:
 
     def replan(self):
         with self.lock:
-            grid, pose, state = self.grid, self.pose, self.state
+            grid, pose, state, enabled = self.grid, self.pose, self.state, self.enabled
         if grid is None:
             return
         st, (i0, j0) = grid.state()
@@ -157,14 +213,14 @@ class Explorer:
         h, w = st.shape
         self.grid_meta = {"x0": (i0 - grid.n / 2) * eg.RES, "y0": (j0 - grid.n / 2) * eg.RES,
                           "w": h * eg.RES, "h": w * eg.RES}
-        if state not in ("explore", "home"):
-            return
         local = lambda xy: tuple(grid.cell(xy) - (i0, j0))
         to_world = lambda ij: tuple(np.round(grid.center(np.asarray(ij) + (i0, j0)), 3).tolist())
         bl = [local(b) for b in self.blacklist]
         res = eg.plan(st, local(pose[:2]), bl, local(self.home) if self.going_home else None)
         with self.lock:
             self.frontiers = [(to_world(c), n) for c, n in res.get("frontiers", [])]
+            if not enabled or state not in ("explore", "home") or not self.enabled:
+                return
             if "path" in res:
                 self.path = [to_world(c) for c in res["path"]]
                 self.goal = to_world(res["goal"])
@@ -175,8 +231,7 @@ class Explorer:
                 self.fail(f"无法规划回到起点：{res.get('reason')}")
             else:
                 self.going_home, self.path, self.goal = True, [], None
-                self.state = "home"
-                self.msg = f"{res.get('reason')}，返回起点"
+                self.state, self.msg = "home", f"{res.get('reason')}，返回起点"
 
     # ------------------------------------------------------------ 控制（主线程 10 Hz）
     def send(self, vx, vy, wz):
@@ -195,17 +250,16 @@ class Explorer:
             self.feedback = {"ok": False, "msg": f"7011 遥控服务无响应：{e}"}
         return self.feedback.get("ok", False)
 
-    def fail(self, why):
-        self.state, self.msg = "error", why
-        rospy.logerr(why)
-
     def follow(self, pose):
         """纯追踪：返回 (vx, vy, wz) 或 None（已到达）。全向底盘，但尽量车头朝前进方向。"""
         x, y, yaw = pose
-        if self.goal is None or len(self.path) < 2:
+        if self.goal is None:
             return 0.0, 0.0, 0.0
+        # 先判到达：已在目标处时路径只有一个点
         if math.hypot(self.goal[0] - x, self.goal[1] - y) < ARRIVE:
             return None
+        if len(self.path) < 2:
+            return 0.0, 0.0, 0.0
         pts = np.array(self.path)
         d = np.hypot(pts[:, 0] - x, pts[:, 1] - y)
         i = int(np.argmin(d))
@@ -230,41 +284,47 @@ class Explorer:
         progress = []               # [(时间, x, y)]
         blocked_since = None
         backoff_until, backoff_v = 0.0, (0.0, 0.0)
-        paused_reason = ""
         while not rospy.is_shutdown():
             rate.sleep()
-            with self.lock:
-                pose, pose_t, state = self.pose, self.pose_t, self.state
             now = time.time()
-            if state == "error":
-                self.send(0, 0, 0)
-                break
-            if pose is None:
+            if self.auto_start and self.pose is not None:
+                self.auto_start = False
+                self.enable()
+            with self.lock:
+                pose, pose_t, state, enabled, stop_at = self.pose, self.pose_t, self.state, self.enabled, self.stop_at
+            if stop_at is not None and now >= stop_at:
+                self.stop_recording()
+                continue
+            if not enabled:
+                spun, last_yaw = 0.0, None
+                progress.clear()
+                blocked_since, backoff_until = None, 0.0
                 continue
             if now - pose_t > POSE_STALE:
-                paused_reason = "FAST-LIVO2 位姿中断，暂停"
-                self.msg = paused_reason
+                self.msg = "FAST-LIVO2 位姿中断，暂停"
                 continue                # 不再发指令，7011 心跳超时自行减速停车
+            if (self.feedback.get("others") or {}).get("web", math.inf) < TAKEOVER:
+                self.disable("人工接管（7011 有人在遥控），已退出自主建图", stop_robot=False)
+                continue
             if self.feedback.get("estop"):
-                self.msg = "急停中：解除后继续探索"
+                self.msg = "急停中：解除后继续自主建图"
                 self.send(0, 0, 0)
                 continue
-            if now - self.t_start > TIME_LIMIT and not self.going_home:
+            if now - self.t_enter > TIME_LIMIT and not self.going_home:
                 with self.lock:
-                    self.going_home, self.state = True, "home"
+                    self.going_home, self.state, self.goal, self.path = True, "home", None, []
                     self.msg = f"达到时长上限 {TIME_LIMIT / 60:.0f} 分钟，返回起点"
 
-            if state == "starting":
-                self.state, self.msg = "spin", "原地转一圈，先看清四周"
-                continue
             if state == "spin":
                 if last_yaw is not None:
                     spun += abs(wrap(pose[2] - last_yaw))
                 last_yaw = pose[2]
-                if spun >= 2 * math.pi or now - self.t_start > 2 * math.pi / W_MAX * 2.5:
+                if spun >= 2 * math.pi or now - self.t_enter > 2 * math.pi / W_MAX * 2.5:
                     self.send(0, 0, 0)
-                    self.state = "explore"
-                    self.msg = "开始探索"
+                    with self.lock:
+                        self.spun = True
+                        if self.enabled:
+                            self.state, self.msg = "explore", "开始探索"
                 else:
                     self.send(0, 0, W_MAX)
                 continue
@@ -277,14 +337,13 @@ class Explorer:
             if cmd is None:             # 到达
                 progress.clear()
                 blocked_since = None
-                if self.going_home:
-                    self.send(0, 0, 0)
-                    self.finish("探索完成，已回到起点")
-                    break
-                self.goals_done += 1
-                with self.lock:
-                    self.goal, self.path = None, []
                 self.send(0, 0, 0)
+                if self.going_home:
+                    self.finish()
+                    continue
+                with self.lock:
+                    self.goals_done += 1
+                    self.goal, self.path = None, []
                 continue
             self.send(*cmd)
 
@@ -302,24 +361,33 @@ class Explorer:
                        and math.hypot(pose[0] - progress[0][1], pose[1] - progress[0][2]) < STUCK_DIST)
             if (blocked_since and now - blocked_since > BLOCKED_TIME) or stalled:
                 why = "一直被避障挡住" if blocked_since else f"{STUCK_TIME:.0f} s 内几乎没动"
-                if self.goal is not None and not self.going_home:
-                    self.blacklist.append(self.goal)
                 n = math.hypot(cmd[0], cmd[1]) or 1.0
                 backoff_v = (-BACKOFF_V * cmd[0] / n, -BACKOFF_V * cmd[1] / n)
                 backoff_until = now + BACKOFF_TIME
-                self.msg = f"卡住（{why}），后退并换目标"
-                rospy.logwarn(self.msg)
                 with self.lock:
+                    if self.goal is not None and not self.going_home:
+                        self.blacklist.append(self.goal)
                     self.goal, self.path = None, []
+                    self.msg = f"卡住（{why}），后退并换目标"
+                rospy.logwarn(self.msg)
                 progress.clear()
                 blocked_since = None
-        self.send(0, 0, 0)
 
-    def finish(self, why):
-        self.state, self.msg = "done", why
-        rospy.loginfo(why)
+    def finish(self):
+        """回到起点：退出自主建图，开始停止录制的倒计时。"""
+        with self.lock:
+            self.enabled, self.going_home = False, False
+            self.state = "countdown"
+            self.stop_at = time.time() + STOP_COUNTDOWN
+            self.msg = f"自主建图完成，已回到起点；{STOP_COUNTDOWN // 60} 分钟内不取消将自动停止录制"
+        rospy.loginfo(self.msg)
         self.save_result()
-        # 结束录制：record.sh stop 会停掉本进程，所以放到独立会话里跑
+
+    def stop_recording(self):
+        with self.lock:
+            self.stop_at, self.state, self.msg = None, "idle", "倒计时结束，正在停止录制"
+        self.save_result()
+        # record.sh stop 会停掉本进程，所以放到独立会话里跑
         subprocess.Popen([str(PROJECT_DIR / "record.sh"), "stop"], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
@@ -334,32 +402,47 @@ class Explorer:
 
     def snapshot(self, full=False):
         with self.lock:
-            d = {"state": self.state, "msg": self.msg, "elapsed_s": round(time.time() - self.t_start),
-                 "goals_done": self.goals_done, "pose": self.pose and [round(v, 3) for v in self.pose],
-                 "home": self.home and [round(v, 3) for v in self.home], "goal": self.goal,
-                 "path": self.path[::2] if not full else self.path, "frontiers": self.frontiers,
-                 "blacklist": self.blacklist, "grid": self.grid_meta, "cmd": self.cmd,
-                 "applied": self.feedback.get("applied"), "limit_reason": (self.feedback.get("limit") or {}).get("reason"),
-                 "teleop_msg": self.feedback.get("msg") if not self.feedback.get("ok", True) else "",
-                 "v_max": V_MAX, "time_limit_min": TIME_LIMIT / 60, "dry_run": DRY_RUN}
-        return d
+            return {
+                "state": self.state, "msg": self.msg, "enabled": self.enabled,
+                "elapsed_s": round(time.time() - self.t_enter) if self.enabled else None,
+                "stop_in": max(0, round(self.stop_at - time.time())) if self.stop_at else None,
+                "goals_done": self.goals_done, "pose": self.pose and [round(v, 3) for v in self.pose],
+                "home": self.home and [round(v, 3) for v in self.home], "goal": self.goal,
+                "path": self.path if full else self.path[::2], "frontiers": self.frontiers,
+                "blacklist": self.blacklist, "grid": self.grid_meta, "cmd": self.cmd,
+                "applied": self.feedback.get("applied"),
+                "limit_reason": (self.feedback.get("limit") or {}).get("reason") if self.enabled else "",
+                "teleop_msg": self.feedback.get("msg") if self.enabled and not self.feedback.get("ok", True) else "",
+                "v_max": V_MAX, "time_limit_min": TIME_LIMIT / 60, "dry_run": DRY_RUN,
+            }
 
 
 def serve(ex):
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path.startswith("/state"):
-                body, ctype = json.dumps(ex.snapshot(), ensure_ascii=False).encode(), "application/json; charset=utf-8"
-            elif self.path.startswith("/grid.png") and ex.grid_png:
-                body, ctype = ex.grid_png, "image/png"
-            else:
-                return self.send_error(404)
-            self.send_response(200)
+        def reply(self, body, ctype="application/json; charset=utf-8", code=200):
+            if isinstance(body, dict):
+                body = json.dumps(body, ensure_ascii=False).encode()
+            self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/state"):
+                self.reply(ex.snapshot())
+            elif self.path.startswith("/grid.png") and ex.grid_png:
+                self.reply(ex.grid_png, "image/png")
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            action = {"/enable": ex.enable, "/disable": ex.disable, "/cancel": ex.cancel_stop}.get(self.path)
+            if action is None:
+                return self.send_error(404)
+            ok, msg = action()
+            self.reply({"ok": ok, "msg": msg}, code=200 if ok else 409)
 
         def log_message(self, *args):
             pass
@@ -376,17 +459,14 @@ def main():
     rospy.Subscriber("/livox/lidar", PointCloud2, ex.on_cloud, queue_size=1, buff_size=2 ** 24)
     serve(ex)
     threading.Thread(target=ex.plan_loop, daemon=True).start()
-    rospy.loginfo("explorer 启动：限速 %.2f m/s %.2f rad/s，时长上限 %.0f 分钟%s", V_MAX, W_MAX, TIME_LIMIT / 60,
+    rospy.loginfo("explorer 启动：限速 %.2f m/s %.2f rad/s，每次时长上限 %.0f 分钟%s", V_MAX, W_MAX, TIME_LIMIT / 60,
                   "（只算不动）" if DRY_RUN else "")
     try:
         ex.run()
     finally:
-        ex.send(0, 0, 0)
-        if ex.state != "done":
-            ex.save_result()
-    # 结束后保持状态页可读，直到 record.sh stop 停掉本进程
-    while not rospy.is_shutdown():
-        time.sleep(0.5)
+        if ex.enabled:
+            ex.send(0, 0, 0)
+        ex.save_result()
 
 
 if __name__ == "__main__":

@@ -5,13 +5,15 @@
     GET  /api/status      当前状态 + 历史录制列表
     GET  /api/live        实时地图 SSE 流（转发录制中的 scripts/live_map.py）
     GET  /api/camera/<名称>.jpg  环视相机最新画面（录制中；默认 320x240 预览，?full=1 原图）
-    GET  /api/explore     自主探索状态（转发 scripts/explorer.py）；/api/explore/grid.png 2D 栅格图
-    POST /api/start       开始录制；{"explore": true} 同时自主探索
+    GET  /api/explore     自主建图状态（转发录制中的 scripts/explorer.py）；/api/explore/grid.png 2D 栅格图
+    POST /api/explore/enable | disable | cancel   进入 / 退出自主建图，取消完成后的自动停止录制
+    POST /api/start       开始录制
     POST /api/stop        停止录制（后台执行，状态变为 stopping）
 """
 import os
 import re
 import threading
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -90,7 +92,7 @@ class Handler(BaseHandler):
                 with urllib.request.urlopen(url, timeout=3) as r:
                     self.send(200, r.read(), r.headers.get("Content-Type"))
             except OSError:
-                self.send(503, {"error": "未在自主探索"})
+                self.send(503, {"error": "未在录制"})
         elif cam:
             full = "?full=1" if "full=1" in query.split("&") else ""
             try:
@@ -105,13 +107,21 @@ class Handler(BaseHandler):
         if self.path == "/api/start":
             if not busy.acquire(blocking=False):
                 return self.send(409, {"ok": False, "msg": "正在执行其他操作"})
-            args = ["start", "--explore"] if self.body_json().get("explore") else ["start"]
             try:
-                code, out = run_script(RECORD_SH, *args, timeout=150)
+                code, out = run_script(RECORD_SH, "start", timeout=150)
             finally:
                 busy.release()
             last_error.set("" if code == 0 else last_line(out, "启动失败"))
             self.send(200 if code == 0 else 500, {"ok": code == 0, "msg": out})
+        elif self.path in ("/api/explore/enable", "/api/explore/disable", "/api/explore/cancel"):
+            req = urllib.request.Request(EXPLORE_URL + self.path.rsplit("/", 1)[1], data=b"", method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    self.send(r.status, r.read())
+            except urllib.error.HTTPError as e:
+                self.send(e.code, e.read())
+            except OSError:
+                self.send(503, {"ok": False, "msg": "未在录制"})
         elif self.path == "/api/stop":
             if busy.locked():
                 return self.send(409, {"ok": False, "msg": "正在执行其他操作"})
