@@ -5,7 +5,8 @@
     GET  /api/status      当前状态 + 历史录制列表
     GET  /api/live        实时地图 SSE 流（转发录制中的 scripts/live_map.py）
     GET  /api/camera/<名称>.jpg  环视相机最新画面（录制中；默认 320x240 预览，?full=1 原图）
-    POST /api/start       开始录制
+    GET  /api/explore     自主探索状态（转发 scripts/explorer.py）；/api/explore/grid.png 2D 栅格图
+    POST /api/start       开始录制；{"explore": true} 同时自主探索
     POST /api/stop        停止录制（后台执行，状态变为 stopping）
 """
 import os
@@ -20,6 +21,7 @@ PORT = int(os.environ.get("RECORD_WEB_PORT", "7010"))
 RECORD_SH = PROJECT_DIR / "record.sh"
 LIVE_URL = "http://127.0.0.1:7012/stream"
 CAMERA_URL = "http://127.0.0.1:7012/camera/"
+EXPLORE_URL = "http://127.0.0.1:7013/"
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
 CALIB = PROJECT_DIR / "catkin_ws/src/galbot_livo2/config/g1_calib.yaml"
 
@@ -82,6 +84,13 @@ class Handler(BaseHandler):
             self.send(200, status_payload())
         elif path == "/api/live":
             self.proxy_sse(LIVE_URL, "未在录制")
+        elif path in ("/api/explore", "/api/explore/grid.png"):
+            url = EXPLORE_URL + ("grid.png" if path.endswith(".png") else "state")
+            try:
+                with urllib.request.urlopen(url, timeout=3) as r:
+                    self.send(200, r.read(), r.headers.get("Content-Type"))
+            except OSError:
+                self.send(503, {"error": "未在自主探索"})
         elif cam:
             full = "?full=1" if "full=1" in query.split("&") else ""
             try:
@@ -96,8 +105,9 @@ class Handler(BaseHandler):
         if self.path == "/api/start":
             if not busy.acquire(blocking=False):
                 return self.send(409, {"ok": False, "msg": "正在执行其他操作"})
+            args = ["start", "--explore"] if self.body_json().get("explore") else ["start"]
             try:
-                code, out = run_script(RECORD_SH, "start", timeout=150)
+                code, out = run_script(RECORD_SH, *args, timeout=150)
             finally:
                 busy.release()
             last_error.set("" if code == 0 else last_line(out, "启动失败"))

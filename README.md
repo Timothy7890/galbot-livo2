@@ -57,3 +57,13 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 - 底盘 600 x 600 mm（投影圆 625 mm）。手臂等伸出底盘时，在四周 0.8 m 内空旷处点「标定车身轮廓」，结果存 `catkin_ws/src/galbot_livo2/config/self_mask.json`
 - 每条指令只持续 0.5 s；服务端 0.35 s 内没收到新指令（松手、切走页面、断线）立即 `stop_base`
 - 急停会锁定，解除前忽略一切速度指令；默认限速 0.5 m/s、1.0 rad/s（`web/teleop_server.py`）
+
+## 自主建图（7010「自主建图」或 `./record.sh start --explore`）
+
+从零开始自己走遍封闭场地：原地环视一圈 → 反复选最近、最大的边界（已知可通行与未知的交界）并前往 → 没有边界或超过时长上限后回到起点 → 自动停止录制。
+
+- `scripts/explore_grid.py`：FAST-LIVO2 位姿 + Mid-360 射线投射的 2D 占据栅格（10 cm），边界检测，Dijkstra 规划（障碍膨胀车身半径 + 0.1 m，路线尽量走中间）
+- `scripts/explorer.py`：纯追踪跟随（车头尽量朝前进方向），卡住（8 s 几乎没动或 4 s 一直被避障挡住）则后退、拉黑目标、换下一个；位姿中断暂停，位姿跳变（定位跑飞）停止探索
+- 速度经 7011 遥控服务下发，避障、加减速、急停都在那里；7011 急停期间探索暂停，解除后继续
+- 默认限速 0.15 m/s、0.4 rad/s，时长上限 30 分钟：`EXPLORE_V` / `EXPLORE_W` / `EXPLORE_MINUTES` 环境变量可改；`EXPLORE_DRY_RUN=1` 只算不动
+- 录制目录另存 `explore.json`（过程记录）与 `explore_grid.png`（2D 栅格）

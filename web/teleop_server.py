@@ -5,14 +5,16 @@
     GET  /api/status        SDK 状态、里程计、最近一次指令结果
     GET  /api/scan          避障用的障碍点、8 个超声波读数、限速明细（网页俯视图）
     GET  /api/camera/<名称>.jpg  环视相机最新画面（默认 320x240 预览，?full=1 原图）
-    POST /api/cmd           {"vx", "vy", "wz", "safe"} 速度指令，按住期间网页每 0.1 s 发一次
+    POST /api/cmd           {"vx", "vy", "wz", "safe", "source"} 速度指令，网页按住期间、自主探索（explorer.py）运行期间
+                            每 0.1 s 发一次；返回上一周期实际下发的速度和避障原因。底盘只由本服务控制，急停对两者都有效
     POST /api/stop          急停（锁定，之后的速度指令一律忽略）
     POST /api/release       解除急停
     POST /api/calibrate     车身自标定：静止采 CAL_FRAMES 帧 Mid-360，记录机器人自身（手臂等），见 safety.py
 
 安全：
 - 发给底盘的每条指令只持续 CMD_DURATION 秒，超时底盘自己停；
-- 本服务 HEARTBEAT 秒内没收到新指令（松手、网页断线、网络卡顿）立即 stop_base；
+- 本服务 HEARTBEAT 秒内没收到新指令（松手、网页断线、网络卡顿）按 DEC 减速到 0，超过 HALT_AFTER 立即 stop_base；
+- 输出按 ACC / DEC 限制加减速，起停平顺；避障要求停车时立即停；
 - safe=true 经 safety.py（Mid-360 + 超声波）按运动方向限速/停车后再下发，false 直接下发（无避障）。
   Galbot 自带的 navigate_with_velocity 需要先有 Galbot 地图并完成定位，否则返回 WAIT_INITIALIZED，首次建图用不了。
 """
@@ -34,7 +36,10 @@ PORT = int(os.environ.get("TELEOP_WEB_PORT", "7011"))
 MAX_V = 0.5          # m/s
 MAX_W = 1.0          # rad/s
 CMD_DURATION = 0.5   # 每条指令在底盘侧的持续时间 (s)
-HEARTBEAT = 0.35     # 超过这么久没收到网页指令就停车 (s)
+HEARTBEAT = 0.35     # 超过这么久没收到新指令就减速停车 (s)
+HALT_AFTER = 1.0     # 超过这么久没收到新指令立即 stop_base (s)
+ACC_V, DEC_V = 0.4, 0.8     # 线加速度、减速度 (m/s²)
+ACC_W, DEC_W = 1.0, 2.0     # 角加速度、减速度 (rad/s²)
 RATE = 10            # 下发频率 (Hz)
 CAL_FRAMES = 20      # 车身自标定采集帧数（约 2 s）
 CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
@@ -50,7 +55,7 @@ class Base:
         self.init_lock = threading.Lock()
         self.robot = self.nav = self.g1 = None
         self.sdk_error = ""
-        self.target = None          # (vx, vy, wz, safe, 收到时间)
+        self.target = None          # (vx, vy, wz, safe, 收到时间, 来源)
         self.moving = False
         self.estop = False
         self.last_result = ""
@@ -90,14 +95,15 @@ class Base:
             return False
 
     # ------------------------------------------------------------ 指令
-    def command(self, vx, vy, wz, safe):
+    def command(self, vx, vy, wz, safe, source="web"):
         clamp = lambda v, m: max(-m, min(m, float(v)))
         with self.lock:
             if self.estop:
                 return False, "急停中，请先解除"
             if self.calib is not None:
                 return False, "车身标定中，请稍候"
-            self.target = (clamp(vx, MAX_V), clamp(vy, MAX_V), clamp(wz, MAX_W), bool(safe), time.time())
+            self.target = (clamp(vx, MAX_V), clamp(vy, MAX_V), clamp(wz, MAX_W), bool(safe), time.time(),
+                           str(source)[:16])
         return True, ""
 
     def stop(self, latch=False):
@@ -170,14 +176,27 @@ class Base:
 
     def _send(self, vx, vy, wz, safe):
         if safe:
-            vx, vy, wz, reason = self.safety.limit(vx, vy, wz)
+            lim = self.safety.limit(vx, vy, wz)
+            reason = lim[3]
+            # 避障要求停下的分量立即停，不走减速斜坡
+            hard = [lim[i] == 0 and (vx, vy, wz)[i] != 0 for i in range(3)]
+            vx, vy, wz = lim[:3]
         else:
-            reason = "避障已关闭"
-        self.applied = (round(vx, 3), round(vy, 3), round(wz, 3))
+            reason, hard = "避障已关闭", [False] * 3
+        dt = 1 / RATE
+        out = []
+        for i, (cur, tgt) in enumerate(zip(self.applied, (vx, vy, wz))):
+            if hard[i]:
+                out.append(0.0)
+                continue
+            acc, dec = (ACC_V, DEC_V) if i < 2 else (ACC_W, DEC_W)
+            step = (acc if abs(tgt) > abs(cur) and tgt * cur >= 0 else dec) * dt
+            out.append(cur + max(-step, min(step, tgt - cur)))
+        self.applied = tuple(round(v, 3) for v in out)
         if not any(self.applied):
             self.robot.stop_base()
             return reason or "已停车"
-        status = self.robot.set_base_velocity([vx, vy, 0.0], [0.0, 0.0, wz], CMD_DURATION)
+        status = self.robot.set_base_velocity([out[0], out[1], 0.0], [0.0, 0.0, out[2]], CMD_DURATION)
         return reason or str(status)
 
     def loop(self):
@@ -190,23 +209,27 @@ class Base:
                         self._read_sensors()
                     except Exception as e:      # noqa: BLE001
                         self.last_result = f"读取传感器异常：{e}"
-                    fresh = target and t0 - target[4] < HEARTBEAT
-                    still = target and not any(target[:3])
-                    if fresh and not still:
+                    age = t0 - target[4] if target else math.inf
+                    if self.moving and age > HALT_AFTER:
+                        self._halt(f"超过 {HALT_AFTER} s 没收到指令，已停车")
+                    elif self.moving or (age < HEARTBEAT and any(target[:3])):
+                        # 指令过期或为 0 时目标速度为 0，按减速度平顺停下
+                        cmd = target[:3] if age < HEARTBEAT else (0.0, 0.0, 0.0)
                         try:
-                            self.last_result = self._send(*target[:4])
-                            self.moving = True
+                            self.last_result = self._send(*cmd, target[3] if target else True)
+                            self.moving = any(self.applied)
+                            if age >= HEARTBEAT and not self.moving:
+                                self.last_result = "超过 0.35 s 没收到指令，已停车"
                         except Exception as e:      # noqa: BLE001
                             self.last_result = f"指令异常：{e}"
-                    elif self.moving:
-                        self._halt("已停车" if still else "超过 0.35 s 没收到指令，已停车")
             time.sleep(max(0.0, 1 / RATE - (time.time() - t0)))
 
     # ------------------------------------------------------------ 状态与相机
     def status(self):
         st = {"sdk_ok": self.robot is not None, "sdk_error": self.sdk_error, "estop": self.estop,
               "moving": self.moving, "last_result": self.last_result, "max_v": MAX_V, "max_w": MAX_W,
-              "applied": self.applied, "calibrating": self.calib is not None, "calib_msg": self.calib_msg}
+              "applied": self.applied, "calibrating": self.calib is not None, "calib_msg": self.calib_msg,
+              "source": self.target[5] if self.target else ""}
         if self.robot is None:
             return st
         odom = self.robot.get_odom()
@@ -269,10 +292,12 @@ class Handler(BaseHandler):
         if self.path == "/api/cmd":
             b = self.body_json()
             try:
-                ok, msg = base.command(b.get("vx", 0), b.get("vy", 0), b.get("wz", 0), b.get("safe", True))
+                ok, msg = base.command(b.get("vx", 0), b.get("vy", 0), b.get("wz", 0), b.get("safe", True),
+                                       b.get("source", "web"))
             except (TypeError, ValueError):
                 ok, msg = False, "参数错误"
-            self.send(200 if ok else 409, {"ok": ok, "msg": msg})
+            self.send(200 if ok else 409, {"ok": ok, "msg": msg, "estop": base.estop, "applied": base.applied,
+                                           "result": base.last_result, "limit": base.safety.last})
         elif self.path == "/api/stop":
             base.stop(latch=True)
             self.send(200, {"ok": True})

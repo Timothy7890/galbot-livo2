@@ -1,10 +1,10 @@
 <script setup>
-// 实时俯视地图：累积栅格（按高度着色）+ 当前扫描 + 机器人位置与轨迹
+// 实时俯视地图：累积栅格（按高度着色）+ 当前扫描 + 机器人位置与轨迹；自主探索时叠加 2D 栅格、边界、目标与路径
 import { onMounted, onUnmounted, ref, watch } from 'vue'
-import { liveUrl } from '../api.js'
+import { exploreGridUrl, liveUrl } from '../api.js'
 import { colorOf, legendGradient, Z_MIN, Z_MAX } from '../colormap.js'
 
-const props = defineProps({ recording: Boolean })
+const props = defineProps({ recording: Boolean, explore: { type: Object, default: null } })
 
 const TILE = 256
 const EMPTY = -32768
@@ -13,6 +13,7 @@ const canvasEl = ref(null)
 const wrapEl = ref(null)
 const follow = ref(true)
 const showScan = ref(true)
+const showExplore = ref(true)
 const conn = ref('idle')          // idle | connecting | live | ended
 const stats = ref({ cells: 0, area: 0, path: 0, fps: 0 })
 
@@ -30,6 +31,17 @@ const view = { vx: 0, vy: 0, scale: 40 }
 let W = 0, H = 0, dpr = 1
 let needDraw = true
 let frames = 0, lastFpsT = performance.now()
+
+// 自主探索叠加层：栅格图随状态每秒刷新，加载完成再替换，避免闪烁
+let gridImg = null
+let gridMeta = null
+watch(() => props.explore, ex => {
+  needDraw = true
+  if (!ex?.grid) return
+  const img = new Image()
+  img.onload = () => { gridImg = img; gridMeta = ex.grid; needDraw = true }
+  img.src = `${exploreGridUrl}?t=${Date.now()}`
+})
 
 let es = null
 let retryTimer = null
@@ -184,6 +196,42 @@ function draw() {
     ctx.drawImage(t.canvas, sx, sy, size, size)
   }
 
+  // 自主探索：2D 栅格（白 可通行 / 红 障碍）、拉黑点、边界、路径、目标、起点
+  const ex = props.explore
+  if (ex && showExplore.value) {
+    if (gridImg && gridMeta) {
+      const [gx, gy] = worldToScreen(gridMeta.x0, gridMeta.y0 + gridMeta.h)
+      ctx.drawImage(gridImg, gx, gy, gridMeta.w * view.scale, gridMeta.h * view.scale)
+    }
+    ctx.fillStyle = '#facc15'
+    for (const [[x, y], n] of ex.frontiers || []) {
+      const [sx, sy] = worldToScreen(x, y)
+      ctx.beginPath(); ctx.arc(sx, sy, Math.min(9, 3 + n / 10), 0, Math.PI * 2); ctx.fill()
+    }
+    ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2
+    for (const [x, y] of ex.blacklist || []) {
+      const [sx, sy] = worldToScreen(x, y)
+      ctx.beginPath(); ctx.moveTo(sx - 6, sy - 6); ctx.lineTo(sx + 6, sy + 6)
+      ctx.moveTo(sx + 6, sy - 6); ctx.lineTo(sx - 6, sy + 6); ctx.stroke()
+    }
+    if (ex.path?.length > 1) {
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
+      ctx.beginPath()
+      ex.path.forEach(([x, y], i) => { const [sx, sy] = worldToScreen(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy) })
+      ctx.stroke()
+    }
+    if (ex.goal) {
+      const [sx, sy] = worldToScreen(ex.goal[0], ex.goal[1])
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
+      ctx.beginPath(); ctx.arc(sx, sy, 8, 0, Math.PI * 2); ctx.stroke()
+    }
+    if (ex.home) {
+      const [sx, sy] = worldToScreen(ex.home[0], ex.home[1])
+      ctx.fillStyle = '#3b82f6'; ctx.fillRect(sx - 6, sy - 6, 12, 12)
+    }
+    ctx.lineWidth = 1
+  }
+
   // 当前扫描
   if (showScan.value && scan.length) {
     ctx.fillStyle = 'rgba(255,255,255,0.75)'
@@ -326,7 +374,7 @@ function fitAll() {
   needDraw = true
 }
 
-watch([follow, showScan], () => (needDraw = true))
+watch([follow, showScan, showExplore], () => (needDraw = true))
 
 let ro = null
 onMounted(() => {
@@ -354,6 +402,7 @@ onUnmounted(() => {
       </span>
       <span class="grow" />
       <label><input v-model="showScan" type="checkbox" /> 当前扫描</label>
+      <label v-if="explore"><input v-model="showExplore" type="checkbox" /> 探索栅格</label>
       <label><input v-model="follow" type="checkbox" /> 跟随机器人</label>
       <button @click="fitAll">全图</button>
     </div>

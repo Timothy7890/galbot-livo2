@@ -118,18 +118,22 @@ class Safety:
                                               "footprint": fp, "keys": keys.tolist()}))
         return f"已标定：机器人自身 {len(keys)} 个格子，安全轮廓 前 {fp['front']} 后 {fp['back']} 左 {fp['left']} 右 {fp['right']} m"
 
+    def is_self(self, xy):
+        """base_link 平面坐标 Nx2 中哪些点属于机器人自身（车身轮廓内或自标定的格子）。"""
+        fp = self.footprint
+        inside = ((xy[:, 0] < fp["front"] + SELF_MARGIN) & (xy[:, 0] > fp["back"] - SELF_MARGIN)
+                  & (xy[:, 1] < fp["left"] + SELF_MARGIN) & (xy[:, 1] > fp["right"] - SELF_MARGIN))
+        if len(self.self_keys) and len(xy):
+            inside |= np.isin(cell_keys(xy), self.self_keys)
+        return inside
+
     # ------------------------------------------------------------ 数据输入
     def update_lidar(self, xyz_base):
         """一帧 Mid-360 点云（已变换到 base_link，Nx3）。"""
         p = xyz_base[(xyz_base[:, 2] > Z_MIN) & (xyz_base[:, 2] < Z_MAX)]
         p = p[np.einsum("ij,ij->i", p[:, :2], p[:, :2]) < RANGE * RANGE]
-        fp = self.footprint
-        inside = ((p[:, 0] < fp["front"] + SELF_MARGIN) & (p[:, 0] > fp["back"] - SELF_MARGIN)
-                  & (p[:, 1] < fp["left"] + SELF_MARGIN) & (p[:, 1] > fp["right"] - SELF_MARGIN))
-        p = p[~inside, :2]
+        p = p[~self.is_self(p[:, :2]), :2]
         if len(p):
-            keys = cell_keys(p)
-            p = p[~np.isin(keys, self.self_keys)]
             # 5 cm 栅格去重，减少计算量和网页传输量
             _, idx = np.unique(cell_keys(p), return_index=True)
             p = p[idx]

@@ -3,7 +3,7 @@
 
   sdk_env.sh python3 gen_config.py [--camera left_front] [--overlay out.jpg]
 
-生成 config/g1_calib.yaml（IMU-雷达、雷达-相机外参，主相机名）和 config/camera_g1.yaml（相机模型）。
+生成 config/g1_calib.yaml（IMU-雷达、雷达-相机外参，主相机名，IMU 在底盘上的位姿）和 config/camera_g1.yaml（相机模型）。
 --overlay 把一帧点云按生成的外参投影到主相机图像上，用来目检外参是否正确。
 """
 import argparse
@@ -23,6 +23,21 @@ IMAGE_SCALE = 0.5  # FAST-LIVO2 内部把图像缩到 640x480 处理，Orin 上�
 
 def fmt(v):
     return "[" + ", ".join(f"{x:.6f}" for x in np.ravel(v)) + "]"
+
+
+def pose7(T):
+    """4x4 -> [x, y, z, qx, qy, qz, qw]（旋转为绕 z 轴等常见情形，取 w 最大的分支即可）。"""
+    R = T[:3, :3]
+    w = np.sqrt(max(0.0, 1 + np.trace(R))) / 2
+    if w > 1e-6:
+        q = [(R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w), w]
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = np.sqrt(max(0.0, 1 + R[i, i] - R[j, j] - R[k, k])) * 2
+        q = [0.0, 0.0, 0.0, (R[k, j] - R[j, k]) / s]
+        q[i], q[j], q[k] = s / 4, (R[j, i] + R[i, j]) / s, (R[k, i] + R[i, k]) / s
+    return list(T[:3, 3]) + q
 
 
 def project(xyz_cam, K):
@@ -62,6 +77,7 @@ def main():
         f.write(f"""# 由 scripts/gen_config.py 从 Galbot SDK 生成，勿手改
 galbot:
   main_camera: {args.camera}
+  imu_in_base: {fmt(pose7(T_b_i))}   # [x y z qx qy qz qw]，FAST-LIVO2 位姿（IMU）换算到底盘用
 
 extrin_calib:
   extrinsic_T: {fmt(T_i_l[:3, 3])}

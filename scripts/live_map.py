@@ -48,7 +48,8 @@ lock = threading.Lock()
 tiles = {}                  # (tx, ty) -> int16[TILE, TILE]，高度 cm
 traj = []                   # [[x, y], ...]
 pose = None                 # [x, y, yaw]
-body_to_world = None        # (R 3x3, t 3)，来自最新里程计
+body_to_world = None        # (R 3x3, t 3)，来自最新里程计（IMU 位姿）
+base_in_imu = None          # 底盘在 IMU 系下的 4x4（galbot/imu_in_base 的逆）；地图上的位置和朝向画底盘的
 lidar_in_imu = np.zeros(3)  # 雷达在 IMU 系下的位置（extrin_calib/extrinsic_T，旋转为单位阵）
 CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
 camera_jpg = {}             # 名称 -> 最新原图 JPEG
@@ -144,10 +145,16 @@ def on_odom(msg):
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ])
     body_to_world = (R, np.array([pp.x, pp.y, pp.z]))
+    # IMU 相对底盘转了 -90° 且在车头方向 0.24 m 处：换算到底盘中心与车头朝向
+    bx, by = pp.x, pp.y
+    if base_in_imu is not None:
+        b = R @ base_in_imu[:3, 3] + body_to_world[1]
+        Rb = R @ base_in_imu[:3, :3]
+        bx, by, yaw = b[0], b[1], math.atan2(Rb[1, 0], Rb[0, 0])
     with lock:
-        pose = [round(pp.x, 3), round(pp.y, 3), round(yaw, 4)]
-        if not traj or math.hypot(pp.x - traj[-1][0], pp.y - traj[-1][1]) > 0.05:
-            traj.append([round(pp.x, 3), round(pp.y, 3)])
+        pose = [round(bx, 3), round(by, 3), round(yaw, 4)]
+        if not traj or math.hypot(bx - traj[-1][0], by - traj[-1][1]) > 0.05:
+            traj.append([round(bx, 3), round(by, 3)])
 
 
 def thumbnail(name):
@@ -223,8 +230,17 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     rospy.init_node("live_map", anonymous=False, disable_signals=False)
     rospy.Subscriber(LIDAR_TOPIC, PointCloud2, on_cloud, queue_size=1, buff_size=2 ** 24)
-    global lidar_in_imu
+    global lidar_in_imu, base_in_imu
     lidar_in_imu = np.array(rospy.get_param("extrin_calib/extrinsic_T", [0.0, 0.0, 0.0]))
+    p = rospy.get_param("galbot/imu_in_base", None)
+    if p:
+        qx, qy, qz, qw = p[3:]
+        T = np.eye(4)
+        T[:3, :3] = [[1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                     [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                     [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]]
+        T[:3, 3] = p[:3]
+        base_in_imu = np.linalg.inv(T)
     rospy.Subscriber(ODOM_TOPIC, Odometry, on_odom, queue_size=10)
     for name in CAMERAS:
         rospy.Subscriber(f"/galbot/{name}/image/compressed", CompressedImage,
