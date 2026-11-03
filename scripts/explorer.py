@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -50,8 +51,9 @@ V_MAX = float(os.environ.get("EXPLORE_V", "0.15"))     # m/s，实测合适
 W_MAX = float(os.environ.get("EXPLORE_W", "0.4"))      # rad/s
 TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60    # 每次进入自主建图的时长上限
 STOP_COUNTDOWN = 120        # 完成后这么久没人取消就停止录制 (s)
-LOOKAHEAD = 0.6             # 纯追踪前视距离 (m)
-TURN_IN_PLACE = math.radians(50)    # 前视点偏离车头超过此角度先原地转
+LOOKAHEAD = 0.9             # 纯追踪前视距离 (m)：路线已拉直，看远一点走得更稳
+TURN_IN, TURN_OUT = math.radians(60), math.radians(20)   # 前视点偏离车头超过 60° 原地转，转到 20° 内再走（滞回，避免走走停停）
+SLOW_ANGLE = math.radians(25)       # 偏离 25° 以内全速
 ARRIVE = 0.3                # 到达目标的距离 (m)
 REPLAN = 1.0                # 重新规划间隔 (s)
 STUCK_TIME, STUCK_DIST = 8.0, 0.05  # 这么久内移动不到这么远算卡住
@@ -71,6 +73,15 @@ def quat_R(qx, qy, qz, qw):
 
 def wrap(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def densify(corners, step=0.1):
+    """拐点之间每 step 米插一个点。"""
+    out = [corners[0]]
+    for a, b in zip(corners, corners[1:]):
+        n = max(1, int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / step)))
+        out += [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(1, n + 1)]
+    return out
 
 
 class Explorer:
@@ -102,9 +113,15 @@ class Explorer:
         self.t_enter = 0.0
         self.stop_at = None         # 倒计时结束时间
         self.goal = None            # 世界坐标 (x, y)
-        self.path = []              # 世界坐标 [(x, y)]
+        self.corners = []           # 规划路线的拐点（世界坐标），网页显示用
+        self.path = []              # 拐点之间每 0.1 m 插值，跟随用
+        self.turning = False        # 原地转向中（滞回）
+        self.lat = deque(maxlen=100)    # 最近 100 次向 7011 发指令的耗时 (ms)
+        self.timeouts = 0
+        self.last_timeout_log = 0.0
         self.frontiers = []
-        self.blacklist = []         # 世界坐标
+        self.blacklist = []         # 卡住而放弃的目标（世界坐标）
+        self.visited = []           # 已到达、但旁边的边界仍看不清的目标（世界坐标），不再去
         self.goals_done = 0
         self.going_home = False
         self.grid_png = b""
@@ -157,7 +174,8 @@ class Explorer:
             if self.enabled:
                 return False, "已在自主建图中"
             self.enabled, self.stop_at, self.going_home = True, None, False
-            self.goal, self.path, self.blacklist = None, [], []
+            self.goal, self.path, self.corners, self.blacklist, self.visited = None, [], [], [], []
+            self.feedback = {}      # 清掉进入前的反馈：里面的 others 记着刚才的人工遥控，会被误判为又一次接管
             self.t_enter = time.time()
             self.state = "explore" if self.spun else "spin"
             self.msg = "开始探索" if self.spun else "原地转一圈，先看清四周"
@@ -170,7 +188,7 @@ class Explorer:
                 return False, "未在自主建图中"
             was = self.enabled
             self.enabled = False
-            self.goal, self.path = None, []
+            self.goal, self.path, self.corners = None, [], []
             if self.state != "error":
                 self.state, self.msg = "idle", why
         if was and stop_robot:
@@ -187,7 +205,7 @@ class Explorer:
 
     def fail(self, why):
         """调用方需持有 self.lock。"""
-        self.enabled, self.goal, self.path = False, None, []
+        self.enabled, self.goal, self.path, self.corners = False, None, [], []
         self.state, self.msg = "error", why
         rospy.logerr(why)
 
@@ -215,15 +233,22 @@ class Explorer:
                           "w": h * eg.RES, "h": w * eg.RES}
         local = lambda xy: tuple(grid.cell(xy) - (i0, j0))
         to_world = lambda ij: tuple(np.round(grid.center(np.asarray(ij) + (i0, j0)), 3).tolist())
-        bl = [local(b) for b in self.blacklist]
-        res = eg.plan(st, local(pose[:2]), bl, local(self.home) if self.going_home else None)
+        with self.lock:
+            bl = [local(b) for b in self.blacklist + self.visited]
+            keep_goal = local(self.goal) if self.goal and enabled else None
+            keep_path = [local(c) for c in self.corners] if self.corners and enabled else None
+        res = eg.plan(st, local(pose[:2]), bl, local(self.home) if self.going_home else None, keep_goal, keep_path)
         with self.lock:
             self.frontiers = [(to_world(c), n) for c, n in res.get("frontiers", [])]
             if not enabled or state not in ("explore", "home") or not self.enabled:
                 return
             if "path" in res:
-                self.path = [to_world(c) for c in res["path"]]
-                self.goal = to_world(res["goal"])
+                goal = to_world(res["goal"])
+                if self.goal is not None and goal != self.goal and not self.going_home:
+                    self.goals_done += 1        # 原目标附近的边界在路上已经看清，换下一个
+                self.corners = [to_world(c) for c in res["path"]]
+                self.path = densify(self.corners)
+                self.goal = goal
                 self.msg = (f"返回起点，剩余 {res['length']:.1f} m" if self.going_home
                             else f"前往第 {self.goals_done + 1} 个边界，路程 {res['length']:.1f} m，"
                                  f"剩余边界 {len(self.frontiers)} 处")
@@ -241,13 +266,19 @@ class Explorer:
             return True
         body = json.dumps({"vx": vx, "vy": vy, "wz": wz, "safe": True, "source": "explore"}).encode()
         req = urllib.request.Request(TELEOP, data=body, method="POST", headers={"Content-Type": "application/json"})
+        t0 = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=0.3) as r:
                 self.feedback = json.loads(r.read())
         except urllib.error.HTTPError as e:
             self.feedback = json.loads(e.read() or b"{}")
         except OSError as e:
+            self.timeouts += 1
             self.feedback = {"ok": False, "msg": f"7011 遥控服务无响应：{e}"}
+            if time.time() - self.last_timeout_log > 5:
+                self.last_timeout_log = time.time()
+                rospy.logwarn("向 7011 发指令失败（累计 %d 次）：%s", self.timeouts, e)
+        self.lat.append((time.perf_counter() - t0) * 1000)
         return self.feedback.get("ok", False)
 
     def follow(self, pose):
@@ -270,11 +301,18 @@ class Explorer:
         bx = math.cos(yaw) * dx + math.sin(yaw) * dy                # 前视点在底盘系
         by = -math.sin(yaw) * dx + math.cos(yaw) * dy
         alpha = math.atan2(by, bx)
-        wz = max(-W_MAX, min(W_MAX, 1.2 * alpha))
-        if abs(alpha) > TURN_IN_PLACE:
+        wz = max(-W_MAX, min(W_MAX, 1.0 * alpha))
+        # 原地转向带滞回：偏离超过 TURN_IN 才停下转，转到 TURN_OUT 以内再走
+        if abs(alpha) > TURN_IN:
+            self.turning = True
+        elif abs(alpha) < TURN_OUT:
+            self.turning = False
+        if self.turning:
             return 0.0, 0.0, wz
         dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
-        v = V_MAX * max(0.4, min(1.0, dist / 0.8)) * math.cos(alpha)
+        v = V_MAX * max(0.4, min(1.0, dist / 0.6))
+        if abs(alpha) > SLOW_ANGLE:
+            v *= math.cos(alpha)
         n = math.hypot(bx, by)
         return v * bx / n, v * by / n, wz
 
@@ -312,7 +350,7 @@ class Explorer:
                 continue
             if now - self.t_enter > TIME_LIMIT and not self.going_home:
                 with self.lock:
-                    self.going_home, self.state, self.goal, self.path = True, "home", None, []
+                    self.going_home, self.state, self.goal, self.path, self.corners = True, "home", None, [], []
                     self.msg = f"达到时长上限 {TIME_LIMIT / 60:.0f} 分钟，返回起点"
 
             if state == "spin":
@@ -343,7 +381,8 @@ class Explorer:
                     continue
                 with self.lock:
                     self.goals_done += 1
-                    self.goal, self.path = None, []
+                    self.visited.append(self.goal)     # 到了还看不清的边界不再来；看清了的边界本来就会消失
+                    self.goal, self.path, self.corners = None, [], []
                 continue
             self.send(*cmd)
 
@@ -367,7 +406,7 @@ class Explorer:
                 with self.lock:
                     if self.goal is not None and not self.going_home:
                         self.blacklist.append(self.goal)
-                    self.goal, self.path = None, []
+                    self.goal, self.path, self.corners = None, [], []
                     self.msg = f"卡住（{why}），后退并换目标"
                 rospy.logwarn(self.msg)
                 progress.clear()
@@ -408,12 +447,14 @@ class Explorer:
                 "stop_in": max(0, round(self.stop_at - time.time())) if self.stop_at else None,
                 "goals_done": self.goals_done, "pose": self.pose and [round(v, 3) for v in self.pose],
                 "home": self.home and [round(v, 3) for v in self.home], "goal": self.goal,
-                "path": self.path if full else self.path[::2], "frontiers": self.frontiers,
-                "blacklist": self.blacklist, "grid": self.grid_meta, "cmd": self.cmd,
+                "path": self.corners, "frontiers": self.frontiers,
+                "blacklist": self.blacklist, "visited": self.visited, "grid": self.grid_meta, "cmd": self.cmd,
                 "applied": self.feedback.get("applied"),
                 "limit_reason": (self.feedback.get("limit") or {}).get("reason") if self.enabled else "",
                 "teleop_msg": self.feedback.get("msg") if self.enabled and not self.feedback.get("ok", True) else "",
                 "v_max": V_MAX, "time_limit_min": TIME_LIMIT / 60, "dry_run": DRY_RUN,
+                "cmd_ms_p90": round(sorted(self.lat)[int(len(self.lat) * 0.9)], 1) if self.lat else None,
+                "cmd_timeouts": self.timeouts,
             }
 
 

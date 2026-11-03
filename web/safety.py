@@ -30,8 +30,9 @@ Z_MIN, Z_MAX = 0.05, 1.60   # 只看这个高度区间的点（地面以上、�
 RANGE = 3.0                 # 只保留 3 m 内的点
 SIDE_MARGIN = 0.05          # 运动通道比车身两侧各宽这么多
 
-LIDAR_STOP, LIDAR_SLOW = 0.25, 0.80     # m，障碍到车身边缘
-US_STOP, US_SLOW = 0.30, 0.60           # m，超声波读数
+# 0.15 m/s 时按 0.8 m/s² 减速只需约 1.5 cm 就能停下，减速带不必太宽，太宽会在杂物多的地方一直慢吞吞
+LIDAR_STOP, LIDAR_SLOW = 0.25, 0.50     # m，障碍到车身边缘
+US_STOP, US_SLOW = 0.30, 0.50           # m，超声波读数
 US_MAX_VALID = 4.0                      # 超过视为无回波
 ROT_STOP, ROT_SLOW = 0.08, 0.25         # 原地转向：车身扫过圆外的余量
 US_ROT_STOP = 0.15                      # 原地转向：任一超声波小于此值不允许转

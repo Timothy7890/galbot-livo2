@@ -29,6 +29,8 @@ const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2
         已到达边界 {{ explore.goals_done }} 处 · 剩余 {{ explore.frontiers.length }} 处
         <template v-if="explore.blacklist.length"> · 拉黑 {{ explore.blacklist.length }} 处</template>
         · 限速 {{ explore.v_max }} m/s
+        <template v-if="explore.cmd_ms_p90 != null"> · 指令耗时 {{ explore.cmd_ms_p90 }} ms</template>
+        <span v-if="explore.cmd_timeouts" class="err-inline"> · 超时 {{ explore.cmd_timeouts }} 次</span>
       </div>
     </template>
   </div>
@@ -51,4 +53,5 @@ const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2
   color: #fff; background: var(--warn); cursor: pointer;
 }
 .meta { font-size: 12px; margin-top: 6px; }
+.err-inline { color: var(--stop); }
 </style>

@@ -24,6 +24,7 @@ INFLATE = ROBOT_R + 0.10    # 规划时障碍膨胀半径：车身 + 余量
 CLEAR_PREF = 0.8            # 离障碍小于此距离的格子加代价，路线尽量走中间 (m)
 MIN_FRONTIER = 5            # 边界至少这么多格（0.5 m）才算
 SIZE_GAIN = 0.5             # 选目标时每米边界抵消多少米路程
+MIN_GOAL_DIST = 1.0         # 目标至少离机器人这么远 (m)：脚边总有看不清的边界（桌下、车身旁），否则会一直选脚下、原地不动
 
 FREE, OCC, UNKNOWN = 0, 1, 2
 
@@ -107,10 +108,46 @@ class Grid:
         return st, (i0, j0)
 
 
-def plan(st, start, blacklist=(), home=None):
+def line_clear(a, b, passable):
+    """a、b 两格之间的直线经过的格子是否都可通行（每半格采样一次）。"""
+    n = int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) * 2)) + 1
+    ii = np.round(np.linspace(a[0], b[0], n)).astype(int)
+    jj = np.round(np.linspace(a[1], b[1], n)).astype(int)
+    h, w = passable.shape
+    if ii.min() < 0 or jj.min() < 0 or ii.max() >= h or jj.max() >= w:
+        return False
+    return bool(passable[ii, jj].all())
+
+
+def shortcut(path, passable):
+    """把栅格上的阶梯路径拉直：从当前点直接连到能直线到达的最远点，只保留拐点。"""
+    out, i = [path[0]], 0
+    while i < len(path) - 1:
+        j = len(path) - 1
+        while j > i + 1 and not line_clear(path[i], path[j], passable):
+            j -= 1
+        out.append(path[j])
+        i = j
+    return out
+
+
+def point_seg_dist(p, a, b):
+    ax, ay, bx, by = a[0], a[1], b[0], b[1]
+    L2 = (bx - ax) ** 2 + (by - ay) ** 2
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((p[0] - ax) * (bx - ax) + (p[1] - ay) * (by - ay)) / L2))
+    return math.hypot(p[0] - ax - t * (bx - ax), p[1] - ay - t * (by - ay))
+
+
+def poly_len(pts):
+    return float(sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))) * RES
+
+
+def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
     """在状态图 st 上从 start（局部格坐标）出发：
     home 为 None 时找边界目标，否则规划回到 home。
-    返回 dict：goal / path（局部格坐标）、frontiers（[(中心格, 格数)]）、reason。"""
+    keep_goal：当前目标，附近仍有边界且可达就继续用它，不每次重新挑（否则目标来回跳、路线扭来扭去、永远到不了）；
+    keep_path：当前路线（拐点），仍全线可通行且机器人没偏离就原样保留。
+    返回 dict：goal / path（局部格坐标的拐点列表）、frontiers（[(中心格, 格数)]）、reason。"""
     h, w = st.shape
     occ = st == OCC
     clear = distance_transform_edt(~occ) * RES                 # 到最近障碍的距离 (m)
@@ -155,25 +192,40 @@ def plan(st, start, blacklist=(), home=None):
     reach[passable] = dist
     out = {"frontiers": []}
 
+    # 每个边界附近 INFLATE + 0.3 m 内的可达格子都可以当目标（边界本身常贴着障碍）
+    r = int(math.ceil((INFLATE + 0.3) / RES))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    # 拉黑的目标（去过但卡住）1 m 内的格子不再作为目标
+    banned = np.zeros((h, w), np.uint8)
+    for bi, bj in blacklist:
+        cv2.circle(banned, (int(bj), int(bi)), int(round(1.0 / RES)), 1, -1)
+    allowed = np.isfinite(reach) & ~banned.astype(bool)
+    ii, jj = np.ogrid[:h, :w]
+    far = (ii - si) ** 2 + (jj - sj) ** 2 >= (MIN_GOAL_DIST / RES) ** 2
+    big = np.zeros((h, w), np.uint8)       # 够大的边界
+    for c in range(1, nlab):
+        size = stats[c, cv2.CC_STAT_AREA]
+        if size >= MIN_FRONTIER:
+            big[lab == c] = 1
+            out["frontiers"].append(((cent[c][1], cent[c][0]), int(size)))
+
+    def goal_still_good(g):
+        gi, gj = g
+        if not (0 <= gi < h and 0 <= gj < w) or not allowed[gi, gj]:
+            return False
+        return bool(big[max(0, gi - r):gi + r + 1, max(0, gj - r):gj + r + 1].any())
+
     if home is not None:
         target = [tuple(home)]
+    elif keep_goal is not None and goal_still_good(keep_goal):
+        target = [tuple(keep_goal)]
     else:
         best, target = math.inf, None
-        # 每个边界附近 INFLATE + 0.3 m 内的可达格子都可以当目标（边界本身常贴着障碍）
-        r = int(math.ceil((INFLATE + 0.3) / RES))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        # 拉黑的目标（去过但卡住）1 m 内的格子不再作为目标
-        banned = np.zeros((h, w), np.uint8)
-        for bi, bj in blacklist:
-            cv2.circle(banned, (int(bj), int(bi)), int(round(1.0 / RES)), 1, -1)
-        allowed = np.isfinite(reach) & ~banned.astype(bool)
         for c in range(1, nlab):
             size = stats[c, cv2.CC_STAT_AREA]
             if size < MIN_FRONTIER:
                 continue
-            ci, cj = cent[c][1], cent[c][0]
-            out["frontiers"].append(((ci, cj), int(size)))
-            near = cv2.dilate((lab == c).astype(np.uint8), kernel).astype(bool) & allowed
+            near = cv2.dilate((lab == c).astype(np.uint8), kernel).astype(bool) & allowed & far
             if not near.any():
                 continue
             cand = np.argwhere(near)
@@ -190,12 +242,23 @@ def plan(st, start, blacklist=(), home=None):
     if not (0 <= ti < h and 0 <= tj < w) or not np.isfinite(reach[ti, tj]):
         out["reason"] = "目标不可达"
         return out
+    # 目标没变、原路线仍全线可通行、机器人离路线不远：沿用原路线，避免每秒换一条
+    if keep_path and tuple(keep_path[-1]) == (ti, tj) and len(keep_path) >= 2:
+        kp = [tuple(p) for p in keep_path]
+        seg = [point_seg_dist((si, sj), a, b) for a, b in zip(kp, kp[1:])]
+        k = int(np.argmin(seg))            # 机器人所在的那一段
+        if seg[k] * RES < 0.5 and all(line_clear(a, b, passable) for a, b in zip(kp[k + 1:], kp[k + 2:])) \
+                and line_clear((si, sj), kp[k + 1], passable):
+            rest = [(si, sj)] + kp[k + 1:]
+            out.update(goal=(ti, tj), path=rest, length=poly_len(rest), kept=True)
+            return out
     path, node, s_node = [], idx[ti, tj], idx[si, sj]
     while node >= 0 and node != s_node:
-        path.append(tuple(cells[node]))
+        path.append(tuple(int(v) for v in cells[node]))
         node = pred[node]
     path.append((si, sj))
-    out.update(goal=(ti, tj), path=path[::-1], length=float(reach[ti, tj]))
+    path = shortcut(path[::-1], passable)
+    out.update(goal=(ti, tj), path=path, length=poly_len(path))
     return out
 
 

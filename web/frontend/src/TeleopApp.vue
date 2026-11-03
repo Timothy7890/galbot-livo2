@@ -1,6 +1,6 @@
 <script setup>
 // 底盘遥控：按住按钮或键盘（W/S 前后、A/D 横移、Q/E 转向、空格急停）期间每 0.1 s 发一次速度指令，
-// 松手、切走页面、断线都会让服务端在 0.35 s 内停车
+// 松手立即平顺减速停车；切走页面、断线时服务端 0.5 s 内开始减速、1 s 内强制停车
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { calibrate, estop, getStatus, release, sendCmd } from './teleopApi.js'
 import CameraView from './components/CameraView.vue'

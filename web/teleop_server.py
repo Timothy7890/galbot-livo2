@@ -37,7 +37,7 @@ PORT = int(os.environ.get("TELEOP_WEB_PORT", "7011"))
 MAX_V = 0.5          # m/s
 MAX_W = 1.0          # rad/s
 CMD_DURATION = 0.5   # 每条指令在底盘侧的持续时间 (s)
-HEARTBEAT = 0.35     # 超过这么久没收到新指令就减速停车 (s)
+HEARTBEAT = 0.5      # 超过这么久没收到新指令就减速停车 (s)；网页经热点遥控时包间隔抖动大，太短会一顿一顿
 HALT_AFTER = 1.0     # 超过这么久没收到新指令立即 stop_base (s)
 ACC_V, DEC_V = 0.4, 0.8     # 线加速度、减速度 (m/s²)
 ACC_W, DEC_W = 1.0, 2.0     # 角加速度、减速度 (rad/s²)
@@ -227,7 +227,7 @@ class Base:
                             self.last_result = self._send(*cmd, target[3] if target else True)
                             self.moving = any(self.applied)
                             if age >= HEARTBEAT and not self.moving:
-                                self.last_result = "超过 0.35 s 没收到指令，已停车"
+                                self.last_result = f"超过 {HEARTBEAT} s 没收到指令，已停车"
                         except Exception as e:      # noqa: BLE001
                             self.last_result = f"指令异常：{e}"
             time.sleep(max(0.0, 1 / RATE - (time.time() - t0)))
