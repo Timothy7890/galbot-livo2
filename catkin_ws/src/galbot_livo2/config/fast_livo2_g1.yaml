@@ -14,7 +14,7 @@ time_offset:
   exposure_time_init: 0.0
 
 preprocess:
-  point_filter_num: 1
+  point_filter_num: 2       # 每两个点取一个：Mid-360 一帧约 2 万点，全用时 Orin 上后期单帧超 100 ms、位姿越积越晚
   filter_size_surf: 0.1
   lidar_type: 8             # LIVOX_PC2：Galbot SDK 给的 PointCloud2，逐点时间在 offset_nsec
   scan_line: 4
@@ -51,8 +51,8 @@ lio:
   layer_init_num: [5, 5, 5, 5, 5]
 
 local_map:
-  map_sliding_en: false
-  half_map_size: 100
+  map_sliding_en: true      # 只保留机器人周围 ±20 m（40 个 0.5 m 体素）参与配准，耗时不随探索范围增长
+  half_map_size: 40
   sliding_thresh: 8
 
 uav:

@@ -1337,7 +1337,8 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
   odomAftMapped.header.frame_id = "camera_init";
   odomAftMapped.child_frame_id = "aft_mapped";
-  odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
+  // 用这帧数据的时间而不是处理完成的时刻：处理落后时下游才知道位姿是哪个时刻的、落后了多久
+  odomAftMapped.header.stamp = ros::Time().fromSec(LidarMeasures.last_lio_update_time);
   set_posestamp(odomAftMapped.pose.pose);
 
   static tf::TransformBroadcaster br;

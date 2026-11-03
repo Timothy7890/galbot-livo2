@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """实时俯视地图推送（由 record.sh 随录制启动，录制结束即退出）。
 
-订阅雷达原始点云 /livox/lidar 和 FAST-LIVO2 的 /aft_mapped_to_init（IMU 位姿），用最新位姿和
-IMU-雷达外参把原始点云变换到世界坐标系（FAST-LIVO2 的 /cloud_registered 在视觉模式下只含相机视野内的点），
+订阅雷达原始点云 /livox/lidar 和 FAST-LIVO2 的 /aft_mapped_to_init（IMU 位姿，带数据时间戳），每帧点云与同一帧的位姿配对
+（FAST-LIVO2 处理落后时先排队等位姿；用"最新位姿"凑合会在转动时把地图抹成一圈），用 IMU-雷达外参变换到世界坐标系（FAST-LIVO2 的 /cloud_registered 在视觉模式下只含相机视野内的点），
 累积到 5 cm 的二维栅格（每格保存最高点高度；高于 Z_CAP 的天花板等不计入，否则俯视图全被天花板盖住），
 通过 http://127.0.0.1:7012/stream 以 SSE 推送给 web/server.py：
 
@@ -19,6 +19,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_v] = "1"
 
 import base64
+from collections import deque
 import re
 import json
 import math
@@ -49,6 +50,9 @@ tiles = {}                  # (tx, ty) -> int16[TILE, TILE]，高度 cm
 traj = []                   # [[x, y], ...]
 pose = None                 # [x, y, yaw]
 body_to_world = None        # (R 3x3, t 3)，来自最新里程计（IMU 位姿）
+odom_hist = deque(maxlen=60)    # [(数据时间, R, t)]
+cloud_q = deque(maxlen=10)      # 等位姿的点云 [(数据时间, 雷达系点)]
+pair_lock = threading.Lock()
 base_in_imu = None          # 底盘在 IMU 系下的 4x4（galbot/imu_in_base 的逆）；地图上的位置和朝向画底盘的
 lidar_in_imu = np.zeros(3)  # 雷达在 IMU 系下的位置（extrin_calib/extrinsic_T，旋转为单位阵）
 CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
@@ -83,14 +87,32 @@ def xyz_from_cloud(msg):
 
 
 def on_cloud(msg):
-    tf = body_to_world
-    if tf is None:          # FAST-LIVO2 尚未初始化
-        return
     xyz = xyz_from_cloud(msg)
     xyz = xyz[np.einsum("ij,ij->i", xyz, xyz) > BLIND * BLIND]
-    if len(xyz) == 0:
-        return
-    R, t = tf
+    if len(xyz):
+        with pair_lock:
+            cloud_q.append((msg.header.stamp.to_sec(), xyz))
+    process_pending()
+
+
+def process_pending():
+    """排队的点云与同一帧的位姿（时间为帧末尾，约晚 0.1 s）配对后处理；等不到位姿的旧点云丢掉。"""
+    while True:
+        with pair_lock:
+            if not cloud_q or not odom_hist:
+                return
+            ts, xyz = cloud_q[0]
+            best = min(odom_hist, key=lambda o: abs(o[0] - (ts + 0.1)))
+            if abs(best[0] - (ts + 0.1)) >= 0.06:
+                if ts + 0.1 < odom_hist[-1][0] - 0.5:
+                    cloud_q.popleft()           # FAST-LIVO2 丢了这帧
+                    continue
+                return                          # 位姿还没到，等
+            cloud_q.popleft()
+        integrate_cloud(xyz, best[1], best[2])
+
+
+def integrate_cloud(xyz, R, t):
     xyz = (xyz + lidar_in_imu) @ R.T + t
     xyz = xyz[xyz[:, 2] < Z_CAP]
     ix = np.floor(xyz[:, 0] / CELL).astype(np.int64)
@@ -145,6 +167,8 @@ def on_odom(msg):
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
     ])
     body_to_world = (R, np.array([pp.x, pp.y, pp.z]))
+    with pair_lock:
+        odom_hist.append((msg.header.stamp.to_sec(), R, body_to_world[1]))
     # IMU 相对底盘转了 -90° 且在车头方向 0.24 m 处：换算到底盘中心与车头朝向
     bx, by = pp.x, pp.y
     if base_in_imu is not None:
@@ -155,6 +179,7 @@ def on_odom(msg):
         pose = [round(bx, 3), round(by, 3), round(yaw, 4)]
         if not traj or math.hypot(bx - traj[-1][0], by - traj[-1][1]) > 0.05:
             traj.append([round(bx, 3), round(by, 3)])
+    process_pending()
 
 
 def thumbnail(name):
