@@ -52,8 +52,7 @@ W_MAX = float(os.environ.get("EXPLORE_W", "0.8"))      # rad/s
 TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60    # 每次进入自主建图的时长上限
 STOP_COUNTDOWN = 120        # 完成后这么久没人取消就停止录制 (s)
 LOOKAHEAD = max(0.9, 3.0 * V_MAX)   # 纯追踪前视距离 (m)：约 3 s 的行程，速度越快看得越远，走得越稳
-TURN_IN, TURN_OUT = math.radians(60), math.radians(20)   # 前视点偏离车头超过 60° 原地转，转到 20° 内再走（滞回，避免走走停停）
-SLOW_ANGLE = math.radians(25)       # 偏离 25° 以内全速
+TURN_GAIN = 1.0             # 车头朝向前进方向的转向增益（边走边转，不原地转）
 ARRIVE = 0.3                # 到达目标的距离 (m)
 REPLAN = 1.0                # 重新规划间隔 (s)
 STUCK_TIME, STUCK_DIST = 8.0, 0.05  # 这么久内移动不到这么远算卡住
@@ -115,7 +114,6 @@ class Explorer:
         self.goal = None            # 世界坐标 (x, y)
         self.corners = []           # 规划路线的拐点（世界坐标），网页显示用
         self.path = []              # 拐点之间每 0.1 m 插值，跟随用
-        self.turning = False        # 原地转向中（滞回）
         self.lat = deque(maxlen=100)    # 最近 100 次向 7011 发指令的耗时 (ms)
         self.timeouts = 0
         self.last_timeout_log = 0.0
@@ -282,7 +280,9 @@ class Explorer:
         return self.feedback.get("ok", False)
 
     def follow(self, pose):
-        """纯追踪：返回 (vx, vy, wz) 或 None（已到达）。全向底盘，但尽量车头朝前进方向。"""
+        """纯追踪：返回 (vx, vy, wz) 或 None（已到达）。
+        底盘全向：直接朝前视点平移（任意方向），同时边走边把车头转向前进方向；
+        转向被避障禁止时（如贴着障碍）照样能平移出去，不会原地卡住。"""
         x, y, yaw = pose
         if self.goal is None:
             return 0.0, 0.0, 0.0
@@ -301,18 +301,9 @@ class Explorer:
         bx = math.cos(yaw) * dx + math.sin(yaw) * dy                # 前视点在底盘系
         by = -math.sin(yaw) * dx + math.cos(yaw) * dy
         alpha = math.atan2(by, bx)
-        wz = max(-W_MAX, min(W_MAX, 1.0 * alpha))
-        # 原地转向带滞回：偏离超过 TURN_IN 才停下转，转到 TURN_OUT 以内再走
-        if abs(alpha) > TURN_IN:
-            self.turning = True
-        elif abs(alpha) < TURN_OUT:
-            self.turning = False
-        if self.turning:
-            return 0.0, 0.0, wz
+        wz = max(-W_MAX, min(W_MAX, TURN_GAIN * alpha))
         dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
         v = V_MAX * max(0.3, min(1.0, dist / (2.5 * V_MAX)))    # 接近目标时减速
-        if abs(alpha) > SLOW_ANGLE:
-            v *= math.cos(alpha)
         n = math.hypot(bx, by)
         return v * bx / n, v * by / n, wz
 

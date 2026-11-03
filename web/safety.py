@@ -153,15 +153,27 @@ class Safety:
 
     # ------------------------------------------------------------ 限速
     def lidar_gap(self, u):
-        """沿单位方向 u 运动时，通道内最近障碍到车身边缘的距离。"""
+        """车身（四周外扩 SIDE_MARGIN 的矩形）沿单位方向 u 平移多远会碰到障碍点。
+        等价于障碍点沿 -u 方向的射线与矩形求交（slab 法）；车身侧旁、平移时擦肩而过的点不算。"""
         if not len(self.pts):
             return math.inf
-        ahead = self.corners @ u
-        lateral = np.abs(self.corners @ np.array([-u[1], u[0]]))
-        s = self.pts @ u
-        l = np.abs(self.pts @ np.array([-u[1], u[0]]))
-        hit = (s > 0) & (l < lateral.max() + SIDE_MARGIN)
-        return float(s[hit].min() - ahead.max()) if hit.any() else math.inf
+        fp = self.footprint
+        lo = np.array([fp["back"] - SIDE_MARGIN, fp["right"] - SIDE_MARGIN])
+        hi = np.array([fp["front"] + SIDE_MARGIN, fp["left"] + SIDE_MARGIN])
+        t_in = np.zeros(len(self.pts))
+        t_out = np.full(len(self.pts), np.inf)
+        for k in (0, 1):
+            d = -u[k]
+            p = self.pts[:, k]
+            if abs(d) < 1e-9:
+                inside = (p >= lo[k]) & (p <= hi[k])
+                t_out = np.where(inside, t_out, -np.inf)
+                continue
+            t1, t2 = (lo[k] - p) / d, (hi[k] - p) / d
+            t_in = np.maximum(t_in, np.minimum(t1, t2))
+            t_out = np.minimum(t_out, np.maximum(t1, t2))
+        hit = t_in <= t_out
+        return float(t_in[hit].min()) if hit.any() else math.inf
 
     def us_gap(self, u):
         heading = math.degrees(math.atan2(u[1], u[0]))

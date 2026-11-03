@@ -179,6 +179,7 @@ const fmt = (v, d = 2) => (v == null ? '-' : Number(v).toFixed(d))
         <tr><td>实际速度</td><td>vx {{ fmt(status.odom?.vx) }} · vy {{ fmt(status.odom?.vy) }} m/s · wz {{ fmt(status.odom?.wz) }} rad/s</td></tr>
         <tr><td>网页指令</td><td>vx {{ fmt(command[0]) }} · vy {{ fmt(command[1]) }} m/s · wz {{ fmt(command[2]) }} rad/s</td></tr>
         <tr><td>实际下发</td><td>vx {{ fmt(status.applied?.[0]) }} · vy {{ fmt(status.applied?.[1]) }} m/s · wz {{ fmt(status.applied?.[2]) }} rad/s</td></tr>
+        <tr><td>底盘调用</td><td>{{ status.sdk_ms_p90 != null ? `${status.sdk_ms_p90} ms（最近 100 次的 90% 分位）` : '-' }}</td></tr>
         <tr><td>结果</td><td :class="{ warn: /停止|禁止|减速|减慢|中断/.test(cmdError || status.last_result) }">{{ cmdError || status.last_result || '-' }}</td></tr>
       </table>
     </section>

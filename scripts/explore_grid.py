@@ -21,7 +21,9 @@ Z_LOW, Z_HIGH = 0.08, 1.60  # 障碍高度带（地面以上，m）
 RAY_MAX = 10.0              # 只用 10 m 内的射线记可通行，远处太稀
 ROBOT_R = 0.3125            # 底盘投影圆半径 (m)
 INFLATE = ROBOT_R + 0.10    # 规划时障碍膨胀半径：车身 + 余量
-CLEAR_PREF = 0.8            # 离障碍小于此距离的格子加代价，路线尽量走中间 (m)
+CLEAR_PREF = 1.2            # 离障碍小于此距离的格子加代价，宽的地方路线尽量走中间 (m)
+CLEAR_WEIGHT = 4.0          # 贴着膨胀边界时每米代价是空旷处的 1 + CLEAR_WEIGHT 倍
+SHORTCUT_CLEAR = 0.9        # 拉直时直线离障碍至少要有原路线那么远（最多要求这么远），否则拉直会重新贴边 (m)
 MIN_FRONTIER = 5            # 边界至少这么多格（0.5 m）才算
 SIZE_GAIN = 0.5             # 选目标时每米边界抵消多少米路程
 MIN_GOAL_DIST = 1.0         # 目标至少离机器人这么远 (m)：脚边总有看不清的边界（桌下、车身旁），否则会一直选脚下、原地不动
@@ -108,23 +110,33 @@ class Grid:
         return st, (i0, j0)
 
 
-def line_clear(a, b, passable):
-    """a、b 两格之间的直线经过的格子是否都可通行（每半格采样一次）。"""
+def line_cells(a, b):
     n = int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) * 2)) + 1
-    ii = np.round(np.linspace(a[0], b[0], n)).astype(int)
-    jj = np.round(np.linspace(a[1], b[1], n)).astype(int)
+    return np.round(np.linspace(a[0], b[0], n)).astype(int), np.round(np.linspace(a[1], b[1], n)).astype(int)
+
+
+def line_clear(a, b, passable, clear=None, need=0.0):
+    """a、b 两格之间的直线经过的格子是否都可通行（每半格采样一次），且离障碍都不小于 need (m)。"""
+    ii, jj = line_cells(a, b)
     h, w = passable.shape
     if ii.min() < 0 or jj.min() < 0 or ii.max() >= h or jj.max() >= w:
         return False
-    return bool(passable[ii, jj].all())
+    if not passable[ii, jj].all():
+        return False
+    return clear is None or bool((clear[ii, jj] >= need).all())
 
 
-def shortcut(path, passable):
-    """把栅格上的阶梯路径拉直：从当前点直接连到能直线到达的最远点，只保留拐点。"""
+def shortcut(path, passable, clear):
+    """把栅格上的阶梯路径拉直：从当前点直接连到能直线到达的最远点，只保留拐点。
+    直线离障碍的距离不得小于原路线这一段的最小距离（最多要求 SHORTCUT_CLEAR），保持走中间。"""
+    pc = np.array([clear[p] for p in path])
     out, i = [path[0]], 0
     while i < len(path) - 1:
         j = len(path) - 1
-        while j > i + 1 and not line_clear(path[i], path[j], passable):
+        while j > i + 1:
+            need = min(SHORTCUT_CLEAR, float(pc[i:j + 1].min())) - RES
+            if line_clear(path[i], path[j], passable, clear, need):
+                break
             j -= 1
         out.append(path[j])
         i = j
@@ -160,7 +172,7 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
     if not (0 <= si < h and 0 <= sj < w) or not passable[si, sj]:
         return {"reason": "起点不在可通行区域"}
 
-    cost = 1.0 + 3.0 * np.clip((CLEAR_PREF - clear) / CLEAR_PREF, 0, 1)
+    cost = 1.0 + CLEAR_WEIGHT * np.clip((CLEAR_PREF - clear) / (CLEAR_PREF - INFLATE), 0, 1)
     idx = -np.ones((h, w), np.int64)
     cells = np.argwhere(passable)
     idx[passable] = np.arange(len(cells))
@@ -257,7 +269,7 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
         path.append(tuple(int(v) for v in cells[node]))
         node = pred[node]
     path.append((si, sj))
-    path = shortcut(path[::-1], passable)
+    path = shortcut(path[::-1], passable, clear)
     out.update(goal=(ti, tj), path=path, length=poly_len(path))
     return out
 

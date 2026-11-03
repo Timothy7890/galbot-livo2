@@ -25,6 +25,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from http.server import ThreadingHTTPServer
 
 import cv2
@@ -51,8 +52,14 @@ class Base:
     """持有 SDK，按最新指令以 RATE 下发；指令过期即停车。"""
 
     def __init__(self):
-        # 状态和底盘调用共用一把锁：急停一旦返回，之后不会再有已经取出的旧指令被下发
+        # lock 只保护指令与急停等状态（网页 / 自主探索的请求立即返回）；
+        # sdk_lock 串行化底盘调用：急停先置标志再拿 sdk_lock 停车，之后不会再有旧指令被下发。
+        # 底盘运动时 SDK 调用可能很慢，由独立的下发线程负责，不拖慢 10 Hz 的计算和请求响应
         self.lock = threading.Lock()
+        self.sdk_lock = threading.Lock()
+        self.out = None             # 待下发的速度 (vx, vy, wz)，None 表示无新指令
+        self.out_event = threading.Event()
+        self.sdk_ms = deque(maxlen=100)     # 最近 100 次底盘调用耗时 (ms)
         self.init_lock = threading.Lock()
         self.robot = self.nav = self.g1 = None
         self.sdk_error = ""
@@ -117,8 +124,10 @@ class Base:
     def stop(self, latch=False):
         with self.lock:
             self.target = None
+            self.out = None
             if latch:
                 self.estop = True
+        with self.sdk_lock:
             self._halt("急停" if latch else "停止")
 
     def release(self):
@@ -135,6 +144,7 @@ class Base:
         return True, "开始标定，约 2 s，期间请勿靠近机器人"
 
     def _halt(self, why):
+        """调用方需持有 sdk_lock。"""
         if self.robot is None:
             return
         try:
@@ -145,6 +155,30 @@ class Base:
         self.moving = False
         self.applied = (0.0, 0.0, 0.0)
         self.last_result = why
+
+    def sender(self):
+        """下发线程：把 loop 算好的最新速度发给底盘。SDK 调用慢时只会少发几次中间值，不会积压。"""
+        while True:
+            self.out_event.wait(0.5)
+            self.out_event.clear()
+            with self.lock:
+                out, self.out = self.out, None
+                if self.estop:
+                    out = None
+            if out is None or self.robot is None:
+                continue
+            with self.sdk_lock:
+                if self.estop:
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    if any(out):
+                        self.robot.set_base_velocity([out[0], out[1], 0.0], [0.0, 0.0, out[2]], CMD_DURATION)
+                    else:
+                        self.robot.stop_base()
+                except Exception as e:      # noqa: BLE001
+                    self.last_result = f"底盘调用异常：{e}"
+                self.sdk_ms.append((time.perf_counter() - t0) * 1000)
 
     def _read_sensors(self):
         """每个周期读一次 Mid-360 和超声波，喂给避障。"""
@@ -201,35 +235,38 @@ class Base:
             step = (acc if abs(tgt) > abs(cur) and tgt * cur >= 0 else dec) * dt
             out.append(cur + max(-step, min(step, tgt - cur)))
         self.applied = tuple(round(v, 3) for v in out)
-        if not any(self.applied):
-            self.robot.stop_base()
-            return reason or "已停车"
-        status = self.robot.set_base_velocity([out[0], out[1], 0.0], [0.0, 0.0, out[2]], CMD_DURATION)
-        return reason or str(status)
+        with self.lock:
+            self.out = self.applied
+        self.out_event.set()
+        return reason or ("已停车" if not any(self.applied) else "行驶中")
 
     def loop(self):
+        threading.Thread(target=self.sender, daemon=True).start()
         while True:
             t0 = time.time()
             with self.lock:
-                target = self.target
-                if self.robot is not None:
-                    try:
-                        self._read_sensors()
-                    except Exception as e:      # noqa: BLE001
-                        self.last_result = f"读取传感器异常：{e}"
-                    age = t0 - target[4] if target else math.inf
-                    if self.moving and age > HALT_AFTER:
+                target, estop = self.target, self.estop
+            if self.robot is not None:
+                try:
+                    self._read_sensors()
+                except Exception as e:      # noqa: BLE001
+                    self.last_result = f"读取传感器异常：{e}"
+                age = t0 - target[4] if target else math.inf
+                if estop:
+                    pass                    # 急停已由 stop() 停车
+                elif self.moving and age > HALT_AFTER:
+                    with self.sdk_lock:
                         self._halt(f"超过 {HALT_AFTER} s 没收到指令，已停车")
-                    elif self.moving or (age < HEARTBEAT and any(target[:3])):
-                        # 指令过期或为 0 时目标速度为 0，按减速度平顺停下
-                        cmd = target[:3] if age < HEARTBEAT else (0.0, 0.0, 0.0)
-                        try:
-                            self.last_result = self._send(*cmd, target[3] if target else True)
-                            self.moving = any(self.applied)
-                            if age >= HEARTBEAT and not self.moving:
-                                self.last_result = f"超过 {HEARTBEAT} s 没收到指令，已停车"
-                        except Exception as e:      # noqa: BLE001
-                            self.last_result = f"指令异常：{e}"
+                elif self.moving or (age < HEARTBEAT and any(target[:3])):
+                    # 指令过期或为 0 时目标速度为 0，按减速度平顺停下
+                    cmd = target[:3] if age < HEARTBEAT else (0.0, 0.0, 0.0)
+                    try:
+                        self.last_result = self._send(*cmd, target[3] if target else True)
+                        self.moving = any(self.applied)
+                        if age >= HEARTBEAT and not self.moving:
+                            self.last_result = f"超过 {HEARTBEAT} s 没收到指令，已停车"
+                    except Exception as e:      # noqa: BLE001
+                        self.last_result = f"指令异常：{e}"
             time.sleep(max(0.0, 1 / RATE - (time.time() - t0)))
 
     # ------------------------------------------------------------ 状态与相机
@@ -237,7 +274,8 @@ class Base:
         st = {"sdk_ok": self.robot is not None, "sdk_error": self.sdk_error, "estop": self.estop,
               "moving": self.moving, "last_result": self.last_result, "max_v": MAX_V, "max_w": MAX_W,
               "applied": self.applied, "calibrating": self.calib is not None, "calib_msg": self.calib_msg,
-              "source": self.target[5] if self.target else ""}
+              "source": self.target[5] if self.target else "",
+              "sdk_ms_p90": round(sorted(self.sdk_ms)[int(len(self.sdk_ms) * 0.9)], 1) if self.sdk_ms else None}
         if self.robot is None:
             return st
         odom = self.robot.get_odom()
