@@ -9,8 +9,8 @@ import ObstacleView from './components/ObstacleView.vue'
 const status = ref({ sdk_ok: false })
 const offline = ref(false)
 const cmdError = ref('')
-const speed = ref(0.2)          // m/s
-const turn = ref(0.5)           // rad/s
+const speed = ref(0.15)         // m/s，实测合适的默认值
+const turn = ref(0.4)           // rad/s
 const safe = ref(true)          // 我们的避障（Mid-360 + 超声波）
 
 // 按键 -> [vx, vy, wz] 方向
