@@ -1,0 +1,16 @@
+<launch>
+  <!-- G1 上实时运行 FAST-LIVO2。先运行一次 scripts/gen_config.py 生成标定配置 -->
+  <arg name="publish_all_cameras" default="true" />
+
+  <rosparam command="load" file="$(find galbot_livo2)/config/fast_livo2_g1.yaml" />
+  <rosparam command="load" file="$(find galbot_livo2)/config/g1_calib.yaml" />
+
+  <node pkg="galbot_livo2" type="sdk_bridge.py" name="sdk_bridge" output="screen"
+        launch-prefix="$(find galbot_livo2)/scripts/sdk_env.sh">
+    <param name="publish_all_cameras" value="$(arg publish_all_cameras)" />
+  </node>
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find galbot_livo2)/config/camera_g1.yaml" />
+  </node>
+</launch>

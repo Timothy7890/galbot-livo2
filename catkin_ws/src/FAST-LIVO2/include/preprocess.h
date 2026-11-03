@@ -145,6 +145,19 @@ struct EIGEN_ALIGN16 Point
 } // namespace robosense_ros
 POINT_CLOUD_REGISTER_POINT_STRUCT(robosense_ros::Point,
                                   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(double, timestamp, timestamp)(std::uint16_t, ring, ring))
+
+namespace livox_pc2
+{
+struct EIGEN_ALIGN16 Point
+{
+  PCL_ADD_POINT4D;
+  std::uint8_t reflectivity;
+  std::uint32_t offset_nsec;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+} // namespace livox_pc2
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_pc2::Point,
+                                  (float, x, x)(float, y, y)(float, z, z)(std::uint8_t, reflectivity, reflectivity)(std::uint32_t, offset_nsec, offset_nsec))
 /*****************/
 
 class Preprocess
@@ -177,6 +190,7 @@ private:
   void Pandar128_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  void livox_pc2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const ros::Time &ct);
   int plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, uint &i_nex, Eigen::Vector3d &curr_direct);

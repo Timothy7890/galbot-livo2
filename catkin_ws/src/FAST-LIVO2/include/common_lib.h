@@ -43,7 +43,8 @@ enum LID_TYPE
   L515 = 4,
   XT32 = 5,
   PANDAR128 = 6,
-  ROBOSENSE = 7
+  ROBOSENSE = 7,
+  LIVOX_PC2 = 8  // Livox 点云以 PointCloud2 给出，逐点相对时间在 offset_nsec（Galbot SDK）
 };
 enum SLAM_MODE
 {

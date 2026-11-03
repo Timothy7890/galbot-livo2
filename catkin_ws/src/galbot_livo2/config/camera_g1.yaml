@@ -1,0 +1,13 @@
+# 由 scripts/gen_config.py 从 Galbot SDK 生成，勿手改。left_front，SDK 给出的等距鱼眼模型
+cam_model: EquidistantCamera
+cam_width: 1280
+cam_height: 960
+scale: 0.5
+cam_fx: 344.229568
+cam_fy: 343.971091
+cam_cx: 640.351246
+cam_cy: 478.260083
+k1: 0.0
+k2: 0.0
+k3: 0.0
+k4: 0.0

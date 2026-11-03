@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>galbot_livo2</name>
+  <version>0.1.0</version>
+  <description>Galbot G1 上运行 FAST-LIVO2：SDK 到 ROS 的桥接、标定配置与启动文件</description>
+  <maintainer email="yx@galbot.local">yx</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>fast_livo</exec_depend>
+</package>

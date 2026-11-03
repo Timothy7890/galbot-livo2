@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     robosense_handler(msg);
     break;
 
+  case LIVOX_PC2:
+    livox_pc2_handler(msg);
+    break;
+
   default:
     printf("Error LiDAR Type: %d \n", lidar_type);
     break;
@@ -198,6 +202,33 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     }
   }
   printf("[ Preprocess ] Output point number: %zu \n", pl_surf.points.size());
+}
+
+void Preprocess::livox_pc2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+  pl_full.clear();
+  pcl::PointCloud<livox_pc2::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.size();
+  pl_surf.reserve(plsize / point_filter_num + 1);
+
+  for (int i = 0; i < plsize; i++)
+  {
+    if (i % point_filter_num != 0) continue;
+    const auto &p = pl_orig.points[i];
+    if (!std::isfinite(p.x) || p.x * p.x + p.y * p.y + p.z * p.z < blind_sqr) continue;
+    PointType added_pt;
+    added_pt.x = p.x;
+    added_pt.y = p.y;
+    added_pt.z = p.z;
+    added_pt.intensity = p.reflectivity;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.curvature = p.offset_nsec / 1e6; // 与 avia_handler 一样，curvature 存帧内相对时间（ms）
+    pl_surf.points.push_back(added_pt);
+  }
 }
 
 void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
