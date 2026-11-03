@@ -52,7 +52,10 @@ W_MAX = float(os.environ.get("EXPLORE_W", "0.8"))      # rad/s
 TIME_LIMIT = float(os.environ.get("EXPLORE_MINUTES", "30")) * 60    # 每次进入自主建图的时长上限
 STOP_COUNTDOWN = 120        # 完成后这么久没人取消就停止录制 (s)
 LOOKAHEAD = max(0.9, 3.0 * V_MAX)   # 纯追踪前视距离 (m)：约 3 s 的行程，速度越快看得越远，走得越稳
-TURN_GAIN = 1.0             # 车头朝向前进方向的转向增益（边走边转，不原地转）
+TURN_GAIN = 1.2             # 车头朝向前进方向的转向增益
+TURN_IN, TURN_OUT = math.radians(45), math.radians(15)   # 偏离超过 45° 先原地转向，转到 15° 内再走（滞回）
+MIN_TURN_W = 0.3            # 原地转向的最小角速度，避免转到最后拖拖拉拉 (rad/s)
+ROT_BLOCKED = 0.3           # 7011 把转向限到原来的这个比例以下，视为此处转不开
 ARRIVE = 0.3                # 到达目标的距离 (m)
 REPLAN = 1.0                # 重新规划间隔 (s)
 STUCK_TIME, STUCK_DIST = 8.0, 0.05  # 这么久内移动不到这么远算卡住
@@ -112,6 +115,7 @@ class Explorer:
         self.t_enter = 0.0
         self.stop_at = None         # 倒计时结束时间
         self.goal = None            # 世界坐标 (x, y)
+        self.turning = False        # 原地转向中（滞回）
         self.corners = []           # 规划路线的拐点（世界坐标），网页显示用
         self.path = []              # 拐点之间每 0.1 m 插值，跟随用
         self.lat = deque(maxlen=100)    # 最近 100 次向 7011 发指令的耗时 (ms)
@@ -281,8 +285,9 @@ class Explorer:
 
     def follow(self, pose):
         """纯追踪：返回 (vx, vy, wz) 或 None（已到达）。
-        底盘全向：直接朝前视点平移（任意方向），同时边走边把车头转向前进方向；
-        转向被避障禁止时（如贴着障碍）照样能平移出去，不会原地卡住。"""
+        车头朝前进方向走（看着自然，相机画面也稳）：偏离大时先原地转向，偏离小时边走边转。
+        只有此处转不开（避障禁止转向，如贴着障碍）时，才利用全向底盘朝前视点平移，挪到能转的地方再转。
+        规划会把拐点和目标放在能转身的地方，所以平移只是兜底。"""
         x, y, yaw = pose
         if self.goal is None:
             return 0.0, 0.0, 0.0
@@ -305,6 +310,18 @@ class Explorer:
         dist = math.hypot(self.goal[0] - x, self.goal[1] - y)
         v = V_MAX * max(0.3, min(1.0, dist / (2.5 * V_MAX)))    # 接近目标时减速
         n = math.hypot(bx, by)
+        if abs(alpha) > TURN_IN:
+            self.turning = True
+        elif abs(alpha) < TURN_OUT:
+            self.turning = False
+        lim = self.feedback.get("limit") or {}
+        rot_blocked = abs(self.cmd[2]) > 0.05 and lim.get("rot_scale", 1.0) < ROT_BLOCKED
+        if self.turning and not rot_blocked:
+            return 0.0, 0.0, math.copysign(max(MIN_TURN_W, abs(wz)), alpha)
+        if self.turning:                # 转不开：先平移挪出去，同时继续尝试转向
+            v *= 0.5
+        else:
+            v *= math.cos(alpha)        # 15°~45° 之间边转边减速
         return v * bx / n, v * by / n, wz
 
     def run(self):

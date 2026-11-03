@@ -24,6 +24,8 @@ INFLATE = ROBOT_R + 0.10    # 规划时障碍膨胀半径：车身 + 余量
 CLEAR_PREF = 1.2            # 离障碍小于此距离的格子加代价，宽的地方路线尽量走中间 (m)
 CLEAR_WEIGHT = 4.0          # 贴着膨胀边界时每米代价是空旷处的 1 + CLEAR_WEIGHT 倍
 SHORTCUT_CLEAR = 0.9        # 拉直时直线离障碍至少要有原路线那么远（最多要求这么远），否则拉直会重新贴边 (m)
+TURN_CLEAR = 0.6            # 能原地转身的地方离障碍至少这么远（底盘半径 0.31 + 避障转向余量 0.25）(m)；
+                            # 拐点和目标尽量放在这样的地方，转向不会被墙角卡住，只有窄路才放宽
 MIN_FRONTIER = 5            # 边界至少这么多格（0.5 m）才算
 SIZE_GAIN = 0.5             # 选目标时每米边界抵消多少米路程
 MIN_GOAL_DIST = 1.0         # 目标至少离机器人这么远 (m)：脚边总有看不清的边界（桌下、车身旁），否则会一直选脚下、原地不动
@@ -130,14 +132,19 @@ def shortcut(path, passable, clear):
     """把栅格上的阶梯路径拉直：从当前点直接连到能直线到达的最远点，只保留拐点。
     直线离障碍的距离不得小于原路线这一段的最小距离（最多要求 SHORTCUT_CLEAR），保持走中间。"""
     pc = np.array([clear[p] for p in path])
+    last = len(path) - 1
     out, i = [path[0]], 0
-    while i < len(path) - 1:
-        j = len(path) - 1
-        while j > i + 1:
+    while i < last:
+        visible = []
+        for j in range(last, i, -1):
             need = min(SHORTCUT_CLEAR, float(pc[i:j + 1].min())) - RES
-            if line_clear(path[i], path[j], passable, clear, need):
-                break
-            j -= 1
+            if j == i + 1 or line_clear(path[i], path[j], passable, clear, need):
+                visible.append(j)
+                if j == last or pc[j] >= TURN_CLEAR:
+                    break           # 最远的、能在那里转身的可见点
+        # 拐点（要转向的地方）优先放在能转身处；实在没有（窄路）就取最远的可见点
+        good = [j for j in visible if j == last or pc[j] >= TURN_CLEAR]
+        j = good[0] if good else visible[0]
         out.append(path[j])
         i = j
     return out
@@ -240,6 +247,9 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
             near = cv2.dilate((lab == c).astype(np.uint8), kernel).astype(bool) & allowed & far
             if not near.any():
                 continue
+            roomy = near & (clear >= TURN_CLEAR)      # 目标尽量选能转身的地方
+            if roomy.any():
+                near = roomy
             cand = np.argwhere(near)
             dd = reach[near]
             j = int(np.argmin(dd))
