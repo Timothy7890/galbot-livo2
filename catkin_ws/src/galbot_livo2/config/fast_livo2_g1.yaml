@@ -71,10 +71,10 @@ evo:
   pose_output_en: false
 
 pcd_save:
-  pcd_save_en: false
+  pcd_save_en: true         # 结束时保存彩色地图，record.sh 移到录制目录
   type: 0
   colmap_output_en: false
-  filter_size_pcd: 0.15
+  filter_size_pcd: 0.05    # map.pcd 降采样体素，作为 3DGS 初始点云
   interval: -1
 
 image_save:

@@ -5,3 +5,9 @@ catkin_ws/.catkin_tools/
 thirdparty/*/build/
 thirdparty/install/
 __pycache__/
+
+# 运行时状态
+run/
+# 前端依赖（web/dist 提交，HPU 上没有 node）
+web/frontend/node_modules/
+web/frontend/package-lock.json

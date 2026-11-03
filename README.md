@@ -34,3 +34,17 @@ roslaunch galbot_livo2 mapping.launch
 ```
 
 `--overlay` 把点云按外参投影到图像上，用来目检标定。`sdk_env.sh` 让 SDK 只加载系统里没有的 Galbot 库，避免顶替系统库。
+
+## 录制网页（7010）
+
+```bash
+web/web.sh start       # 启动网页服务；web/web.sh autostart 设为开机自启
+```
+
+浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制、实时俯视地图（1.6 m 以下的点，按高度着色）、主相机画面、历史记录。
+命令行等价操作：`./record.sh start | stop | status`。每次录制保存在 `~/yx/Data/galbot_livo2/<开始时间>/`：
+
+- `raw.bag`：点云、IMU、4 路环视相机 JPEG，约 38 GB/小时
+- `map.pcd`（5 cm 降采样彩色地图）、`map_raw.pcd`、`trajectory.csv`、`lidar_poses.txt`、`config/`、`logs/`、`info.txt`
+
+前端改动后在有 node 的机器上 `cd web/frontend && npm install && npm run build`，把 `web/dist` 一起提交。
