@@ -4,11 +4,12 @@
     GET  /                控制页面（web/frontend 构建产物 web/dist/index.html）
     GET  /api/status      当前状态 + 历史录制列表
     GET  /api/live        实时地图 SSE 流（转发录制中的 scripts/live_map.py）
-    GET  /api/camera.jpg  主相机最新画面（录制中）
+    GET  /api/camera/<名称>.jpg  环视相机最新画面（录制中；默认 320x240 预览，?full=1 原图）
     POST /api/start       开始录制
     POST /api/stop        停止录制（后台执行，状态变为 stopping）
 """
 import os
+import re
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -18,7 +19,16 @@ from webcommon import DATA_ROOT, PROJECT_DIR, BaseHandler, LastError, last_line,
 PORT = int(os.environ.get("RECORD_WEB_PORT", "7010"))
 RECORD_SH = PROJECT_DIR / "record.sh"
 LIVE_URL = "http://127.0.0.1:7012/stream"
-CAMERA_URL = "http://127.0.0.1:7012/camera.jpg"
+CAMERA_URL = "http://127.0.0.1:7012/camera/"
+CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
+CALIB = PROJECT_DIR / "catkin_ws/src/galbot_livo2/config/g1_calib.yaml"
+
+
+def main_camera():
+    """FAST-LIVO2 用的主相机名（g1_calib.yaml 的 galbot/main_camera）。"""
+    m = re.search(r"^\s*main_camera:\s*(\w+)", CALIB.read_text(), re.M) if CALIB.exists() else None
+    return m.group(1) if m else "left_front"
+
 
 busy = threading.Lock()   # 同一时间只允许一个 start/stop
 last_error = LastError()
@@ -51,6 +61,7 @@ def status_payload():
         st["status"] = "starting"
     st["error"] = last_error.get()
     st["data_root"] = str(DATA_ROOT)
+    st["main_camera"] = main_camera()
     st["sessions"] = list_sessions()
     return st
 
@@ -65,14 +76,16 @@ class Handler(BaseHandler):
     index_page = "index.html"
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
+        cam = CAMERA_PATH.match(path)
         if path == "/api/status":
             self.send(200, status_payload())
         elif path == "/api/live":
             self.proxy_sse(LIVE_URL, "未在录制")
-        elif path == "/api/camera.jpg":
+        elif cam:
+            full = "?full=1" if "full=1" in query.split("&") else ""
             try:
-                with urllib.request.urlopen(CAMERA_URL, timeout=3) as r:
+                with urllib.request.urlopen(f"{CAMERA_URL}{cam.group(1)}.jpg{full}", timeout=3) as r:
                     self.send(200, r.read(), "image/jpeg")
             except OSError:
                 self.send(503, {"error": "未在录制"})

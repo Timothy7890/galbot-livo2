@@ -104,5 +104,5 @@ class BaseHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         line = str(args[0] if args else "")
-        if "/api/" in line and not any(s in line for s in ("/status", "/camera.jpg")):
+        if "/api/" in line and not any(s in line for s in ("/status", "/camera/")):
             super().log_message(fmt, *args)

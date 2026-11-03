@@ -9,7 +9,8 @@ IMU-雷达外参把原始点云变换到世界坐标系（FAST-LIVO2 的 /cloud_
     event: snapshot  {"cell", "cells": b64(int16 ix,iy,zcm)*, "traj": [[x,y],...], "pose"}
     event: frame     {"d": b64(新增/升高的格子 int16 ix,iy,zcm), "s": b64(当前帧格子 int16 ix,iy), "p": [x,y,yaw]}
 
-另提供 http://127.0.0.1:7012/camera.jpg：主相机最新一帧 JPEG。
+另提供 http://127.0.0.1:7012/camera/<名称>.jpg：4 路环视相机最新一帧。默认是缩小到 1/4（320x240）的
+预览图，只在有人请求时才解码缩放，每帧只做一次；加 ?full=1 返回原图。
 """
 import os
 
@@ -18,12 +19,14 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_v] = "1"
 
 import base64
+import re
 import json
 import math
 import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import cv2
 import numpy as np
 import rospy
 from nav_msgs.msg import Odometry
@@ -47,7 +50,10 @@ traj = []                   # [[x, y], ...]
 pose = None                 # [x, y, yaw]
 body_to_world = None        # (R 3x3, t 3)，来自最新里程计
 lidar_in_imu = np.zeros(3)  # 雷达在 IMU 系下的位置（extrin_calib/extrinsic_T，旋转为单位阵）
-camera_jpg = None           # 主相机最新 JPEG
+CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
+camera_jpg = {}             # 名称 -> 最新原图 JPEG
+camera_thumb = {}           # 名称 -> (原图 JPEG, 预览 JPEG)，按需生成
+CAMERA_PATH = re.compile(r"^/camera/(\w+)\.jpg$")
 clients = []                # 每个连接一个 queue
 
 
@@ -144,9 +150,17 @@ def on_odom(msg):
             traj.append([round(pp.x, 3), round(pp.y, 3)])
 
 
-def on_camera(msg):
-    global camera_jpg
-    camera_jpg = bytes(msg.data)
+def thumbnail(name):
+    jpg = camera_jpg.get(name)
+    if jpg is None:
+        return None
+    cached = camera_thumb.get(name)
+    if cached and cached[0] is jpg:
+        return cached[1]
+    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_REDUCED_COLOR_4)  # 解码时直接缩小，比先解码再缩快得多
+    thumb = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
+    camera_thumb[name] = (jpg, thumb)
+    return thumb
 
 
 def snapshot():
@@ -162,8 +176,10 @@ def snapshot():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/camera.jpg":
-            return self.send_camera()
+        path, _, query = self.path.partition("?")
+        m = CAMERA_PATH.match(path)
+        if m:
+            return self.send_camera(m.group(1), "full=1" in query.split("&"))
         if self.path != "/stream":
             self.send_error(404)
             return
@@ -188,8 +204,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             clients.remove(q)
 
-    def send_camera(self):
-        jpg = camera_jpg
+    def send_camera(self, name, full):
+        jpg = camera_jpg.get(name) if full else thumbnail(name)
         if jpg is None:
             self.send_error(503)
             return
@@ -209,10 +225,11 @@ def main():
     rospy.Subscriber(LIDAR_TOPIC, PointCloud2, on_cloud, queue_size=1, buff_size=2 ** 24)
     global lidar_in_imu
     lidar_in_imu = np.array(rospy.get_param("extrin_calib/extrinsic_T", [0.0, 0.0, 0.0]))
-    main_cam = rospy.get_param("galbot/main_camera", "left_front")
     rospy.Subscriber(ODOM_TOPIC, Odometry, on_odom, queue_size=10)
-    rospy.Subscriber(f"/galbot/{main_cam}/image/compressed", CompressedImage, on_camera, queue_size=1,
-                     buff_size=2 ** 22)
+    for name in CAMERAS:
+        rospy.Subscriber(f"/galbot/{name}/image/compressed", CompressedImage,
+                         lambda msg, n=name: camera_jpg.__setitem__(n, bytes(msg.data)),
+                         queue_size=1, buff_size=2 ** 22)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()

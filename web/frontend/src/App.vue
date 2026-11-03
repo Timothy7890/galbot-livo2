@@ -70,7 +70,7 @@ onUnmounted(() => clearInterval(timer))
       @start="onStart"
       @stop="onStop"
     />
-    <CameraView class="cam" :recording="recording" />
+    <CameraView class="cam" :recording="recording" :main-camera="status.main_camera" />
     <SessionList class="list" :sessions="status.sessions || []" :data-root="status.data_root" />
     <section class="map">
       <LiveMap :recording="recording" />

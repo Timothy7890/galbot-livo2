@@ -14,4 +14,4 @@ export async function stopRecording() {
 }
 
 export const liveUrl = 'api/live'
-export const cameraUrl = 'api/camera.jpg'
+export const cameraUrl = name => `api/camera/${name}.jpg`
