@@ -2,15 +2,16 @@
 // 底盘遥控：按住按钮或键盘（W/S 前后、A/D 横移、Q/E 转向、空格急停）期间每 0.1 s 发一次速度指令，
 // 松手、切走页面、断线都会让服务端在 0.35 s 内停车
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { estop, getStatus, release, sendCmd } from './teleopApi.js'
+import { calibrate, estop, getStatus, release, sendCmd } from './teleopApi.js'
 import CameraView from './components/CameraView.vue'
+import ObstacleView from './components/ObstacleView.vue'
 
 const status = ref({ sdk_ok: false })
 const offline = ref(false)
 const cmdError = ref('')
 const speed = ref(0.2)          // m/s
 const turn = ref(0.5)           // rad/s
-const safe = ref(true)          // Galbot 碰撞检测
+const safe = ref(true)          // 我们的避障（Mid-360 + 超声波）
 
 // 按键 -> [vx, vy, wz] 方向
 const DIRS = {
@@ -65,8 +66,15 @@ async function onRelease() {
   refresh()
 }
 
+async function onCalibrate() {
+  if (!confirm('标定车身：机器人静止约 2 s，记录 Mid-360 看到的机器人自身（手臂等）。\n\n' +
+    '请先确认机器人四周 0.8 m 内没有任何障碍物和人，否则障碍物会被当成机器人的一部分。开始？')) return
+  const r = await calibrate()
+  cmdError.value = r.ok ? '' : r.msg
+}
+
 function onSafeChange(e) {
-  if (!e.target.checked && !confirm('关闭碰撞检测后底盘不会避障，只能靠你手动停车。确定关闭？')) {
+  if (!e.target.checked && !confirm('关闭避障后底盘不会因障碍减速或停车，只能靠你手动停车。确定关闭？')) {
     e.target.checked = true
     return
   }
@@ -156,8 +164,12 @@ const fmt = (v, d = 2) => (v == null ? '-' : Number(v).toFixed(d))
       </label>
       <label class="check">
         <input type="checkbox" :checked="safe" @change="onSafeChange" />
-        碰撞检测（Galbot 融合全部传感器避障）
+        避障（Mid-360 + 超声波，按运动方向减速 / 停车）
       </label>
+      <button class="calib" :disabled="!status.sdk_ok || status.moving || status.calibrating" @click="onCalibrate">
+        {{ status.calibrating ? '标定中…' : '标定车身轮廓' }}
+      </button>
+      <div v-if="status.calib_msg" class="muted calib-msg">{{ status.calib_msg }}</div>
     </section>
 
     <section class="card info">
@@ -165,12 +177,13 @@ const fmt = (v, d = 2) => (v == null ? '-' : Number(v).toFixed(d))
       <table class="num">
         <tr><td>位置</td><td>x {{ fmt(status.odom?.x) }} m · y {{ fmt(status.odom?.y) }} m · 朝向 {{ fmt(status.odom?.yaw, 1) }}°</td></tr>
         <tr><td>实际速度</td><td>vx {{ fmt(status.odom?.vx) }} · vy {{ fmt(status.odom?.vy) }} m/s · wz {{ fmt(status.odom?.wz) }} rad/s</td></tr>
-        <tr><td>发送指令</td><td>vx {{ fmt(command[0]) }} · vy {{ fmt(command[1]) }} m/s · wz {{ fmt(command[2]) }} rad/s</td></tr>
-        <tr><td>指令结果</td><td>{{ cmdError || status.last_result || '-' }}</td></tr>
-        <tr><td>导航状态</td><td>{{ status.nav_status || '-' }}</td></tr>
+        <tr><td>网页指令</td><td>vx {{ fmt(command[0]) }} · vy {{ fmt(command[1]) }} m/s · wz {{ fmt(command[2]) }} rad/s</td></tr>
+        <tr><td>实际下发</td><td>vx {{ fmt(status.applied?.[0]) }} · vy {{ fmt(status.applied?.[1]) }} m/s · wz {{ fmt(status.applied?.[2]) }} rad/s</td></tr>
+        <tr><td>结果</td><td :class="{ warn: /停止|禁止|减速|减慢|中断/.test(cmdError || status.last_result) }">{{ cmdError || status.last_result || '-' }}</td></tr>
       </table>
     </section>
 
+    <ObstacleView class="obst" :active="status.sdk_ok" :command="command" />
     <CameraView class="cams" :active="status.sdk_ok" idle-text="连接 SDK 后显示" />
   </main>
 </template>
@@ -178,9 +191,9 @@ const fmt = (v, d = 2) => (v == null ? '-' : Number(v).toFixed(d))
 <style scoped>
 .layout {
   display: grid;
-  grid-template-columns: 360px 1fr;
+  grid-template-columns: 340px minmax(320px, 1fr) minmax(320px, 1fr);
   grid-template-rows: auto auto 1fr;
-  grid-template-areas: "head head" "ctrl cams" "info cams";
+  grid-template-areas: "head head head" "ctrl obst cams" "info obst cams";
   gap: 16px;
   padding: 16px;
   min-height: 100vh;
@@ -191,6 +204,14 @@ h1 { font-size: 20px; margin: 0; }
 .ctrl { grid-area: ctrl; display: flex; flex-direction: column; gap: 12px; }
 .info { grid-area: info; }
 .cams { grid-area: cams; }
+.obst { grid-area: obst; }
+.calib {
+  border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px;
+  padding: 8px; cursor: pointer;
+}
+.calib:disabled { opacity: 0.4; cursor: default; }
+.calib-msg { font-size: 12px; }
+td.warn { color: var(--warn); font-weight: 600; }
 .state { display: flex; align-items: center; gap: 10px; font-size: 16px; }
 .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--warn); }
 .dot.ok { background: var(--go); }
@@ -219,6 +240,6 @@ td { padding: 4px 2px; border-bottom: 1px solid var(--line); vertical-align: top
 td:first-child { color: var(--muted); white-space: nowrap; width: 64px; }
 
 @media (max-width: 860px) {
-  .layout { grid-template-columns: 1fr; grid-template-areas: "head" "ctrl" "cams" "info"; }
+  .layout { grid-template-columns: 1fr; grid-template-areas: "head" "ctrl" "obst" "cams" "info"; }
 }
 </style>

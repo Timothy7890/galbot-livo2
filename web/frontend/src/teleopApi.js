@@ -15,3 +15,4 @@ export async function getStatus() {
 export const sendCmd = (vx, vy, wz, safe) => post('api/cmd', { vx, vy, wz, safe })
 export const estop = () => post('api/stop')
 export const release = () => post('api/release')
+export const calibrate = () => post('api/calibrate')

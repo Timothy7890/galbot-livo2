@@ -53,6 +53,7 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 
 浏览器打开 `http://<HPU>:7011`（本机经 ssh 转发为 17711）。按住按钮或键盘 W/S 前后、A/D 横移、Q/E 转向，空格急停。
 
-- 默认经 `navigate_with_velocity` 下发，开启 Galbot 的碰撞检测；可关闭改用 `set_base_velocity`（无避障，需确认）
+- 避障（默认开）：`web/safety.py` 用 Mid-360（0.05–1.6 m 高的点）与 8 个超声波，按运动方向在 0.8/0.6 m 内减速、0.25/0.30 m 内停车，退离障碍不受限；可关闭（需确认）。Galbot 自带避障 `navigate_with_velocity` 需先有 Galbot 地图并定位，否则返回 WAIT_INITIALIZED
+- 底盘 600 x 600 mm（投影圆 625 mm）。手臂等伸出底盘时，在四周 0.8 m 内空旷处点「标定车身轮廓」，结果存 `catkin_ws/src/galbot_livo2/config/self_mask.json`
 - 每条指令只持续 0.5 s；服务端 0.35 s 内没收到新指令（松手、切走页面、断线）立即 `stop_base`
 - 急停会锁定，解除前忽略一切速度指令；默认限速 0.5 m/s、1.0 rad/s（`web/teleop_server.py`）
