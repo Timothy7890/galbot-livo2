@@ -1,8 +1,11 @@
 # galbot-livo2
 
 在 Galbot G1 的 HPU（Jetson AGX Orin）上实时运行 FAST-LIVO2。传感器来自 Galbot SDK：
-底盘 Mid-360 点云与内置 IMU、4 路环视相机（选一路给 FAST-LIVO2，其余原样发布供 3DGS 使用）。
-不停用任何 Galbot 服务。
+底盘 Mid-360 点云与内置 IMU、4 路环视相机（选一路给 FAST-LIVO2，其余原样发布供 3DGS 使用）、
+头部双目相机（只录包供 3DGS 使用）。不停用任何 Galbot 服务。
+
+环视相机、头部相机和手臂都装在躯干上，Mid-360 与 IMU 在底盘上：躯干升降（7011 页面）或头部转动后相机-雷达外参会变。
+`record.sh` 每次开始录制都会从 SDK 现读外参写进录制目录的 `config/`，FAST-LIVO2 用的就是这份；录制中关节变化会记警告。
 
 ## 目录
 
@@ -29,10 +32,12 @@ cd catkin_ws && P=$(cd .. && pwd) L=$(cd .. && pwd)/thirdparty/install/lib \
 ```bash
 source catkin_ws/devel/setup.bash
 S=catkin_ws/src/galbot_livo2/scripts
-$S/sdk_env.sh python3 $S/gen_config.py --camera left_front --overlay /tmp/overlay.jpg   # 外参变了才需要重跑
+$S/sdk_env.sh python3 $S/gen_config.py --camera left_front --overlay /tmp/overlay.jpg   # 手动启动前、外参变了要重跑
 roslaunch galbot_livo2 mapping.launch
 ```
 
+`gen_config.py` 默认写包内 `config/`（`--out` 可改），同时写 `sensors_all.json`：6 路相机的内参、在底盘 / 雷达 / IMU 系下的位姿和 leg / head 关节角
+（SDK 给的头部相机外参朝向与图像不符，离线需重新标定）。`record.sh` 不用包内这份，而是每次以 `--out <录制目录>/config` 重新生成。
 `--overlay` 把点云按外参投影到图像上，用来目检标定。`sdk_env.sh` 让 SDK 只加载系统里没有的 Galbot 库，避免顶替系统库。
 
 ## 录制网页（7010）
@@ -44,8 +49,10 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制、实时俯视地图（1.6 m 以下的点，按高度着色）、主相机画面、历史记录。
 命令行等价操作：`./record.sh start | stop | status`。每次录制保存在 `~/yx/Data/galbot_livo2/<开始时间>/`：
 
-- `raw.bag`：点云、IMU、4 路环视相机 JPEG，约 38 GB/小时
-- `map.pcd`（5 cm 降采样彩色地图）、`map_raw.pcd`、`trajectory.csv`、`lidar_poses.txt`、`config/`、`logs/`、`info.txt`
+- `raw.bag`：点云、IMU、4 路环视（10 Hz）与 2 路头部（15 Hz）相机 JPEG、leg / head 关节角 `/galbot/joint_states`（2 Hz），约 90 GB/小时
+- `config/`：开始录制时从 SDK 现读的标定（`g1_calib.yaml`、`camera_g1.yaml`、`sensors_all.json`）与 FAST-LIVO2 参数
+- `info.txt`：`joints_moved=yes` 表示录制中躯干 / 头部动过，之后的相机外参与 `config/` 不符（见 `logs/bridge.log`）
+- `map.pcd`（5 cm 降采样彩色地图）、`map_raw.pcd`、`trajectory.csv`、`lidar_poses.txt`、`logs/`（`bridge.log` 每 10 s 记各路帧数与丢帧）
 
 前端改动后在有 node 的机器上 `cd web/frontend && npm install && npm run build`，把 `web/dist` 一起提交。
 
@@ -57,7 +64,7 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 - 底盘 600 x 600 mm（投影圆 625 mm）。手臂等伸出底盘时，在四周 0.8 m 内空旷处点「标定车身轮廓」，结果存 `catkin_ws/src/galbot_livo2/config/self_mask.json`
 - 速度以 `duration=0` 10 Hz 持续下发（SDK 的 `set_base_velocity` 带 duration 会阻塞整个时长且不释放 GIL，实测 0.5 s → 卡住整个进程 520 ms）；看门狗 `web/base_watchdog.py` 读心跳 `/dev/shm/galbot_teleop_heartbeat`，7011 崩溃或卡住 0.6 s 以上且在动就 `stop_base`；输出按加减速限制平顺变化；松手立即减速停车，0.5 s 没收到新指令（切走页面、断线）开始减速，1 s 强制 `stop_base`
 - 急停会锁定，解除前忽略一切速度指令；默认限速 0.5 m/s、1.0 rad/s（`web/teleop_server.py`）
-- 躯干高度：低位 / 中位 / 站立三档（`LEG_POSES`，leg 关节组，0.1 rad/s）。录制中、底盘运动中不可用，升降期间底盘指令被拒绝；急停时停止关节轨迹并停在当前位置（不用 `stop_controller`，否则躯干可能下坠）。环视与头部相机在躯干上、Mid-360 在底盘上，升降后需重新标定车身轮廓
+- 躯干高度：低位 / 中位 / 站立三档（`LEG_POSES`，leg 关节组，0.1 rad/s）。录制中、底盘运动中不可用，升降期间底盘指令被拒绝；急停时停止关节轨迹并停在当前位置（不用 `stop_controller`，否则躯干可能下坠）。升降后需重新标定车身轮廓（手臂相对 Mid-360 的位置变了），相机外参在下次开始录制时自动更新
 
 ## 自主建图（录制中在 7010 点「进入自主建图」）
 

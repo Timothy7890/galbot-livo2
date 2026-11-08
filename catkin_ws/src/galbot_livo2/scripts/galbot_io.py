@@ -12,6 +12,15 @@ CAMERAS = {
     "left_rear": S.LEFT_REAR_SURROUND_CAMERA,
     "right_rear": S.RIGHT_REAR_SURROUND_CAMERA,
 }
+# 头部双目（1280x960，15 Hz，基线约 6 cm）：只录包给 3DGS，不给 FAST-LIVO2。
+# 注意 SDK 给的头部外参朝向与图像不符（算出来光轴朝上约 45°，实际朝下），离线需重新标定
+HEAD_CAMERAS = {
+    "head_left": S.HEAD_LEFT_CAMERA,
+    "head_right": S.HEAD_RIGHT_CAMERA,
+}
+ALL_CAMERAS = {**CAMERAS, **HEAD_CAMERAS}
+# 环视、头部相机和手臂都在躯干上，Mid-360 与 IMU 在底盘上：leg / head 关节一动，相机-雷达外参就变
+POSE_JOINT_GROUPS = ("leg", "head")
 
 
 def open_robot(sensors):

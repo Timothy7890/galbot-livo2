@@ -76,7 +76,7 @@ async function onCalibrate() {
 async function onLeg(pose, label) {
   if (!confirm(`躯干升降到「${label}」：关节速度 0.1 rad/s，约 10–20 s。\n\n` +
     '请确认机器人周围（尤其上方和手臂附近）没有人和障碍物，并随时准备点急停（急停会让躯干停在当前位置）。\n' +
-    '升降后相机与雷达的相对位置会变：录制前需重跑 gen_config.py，并重新标定车身轮廓。开始？')) return
+    '升降后请重新标定车身轮廓（相机外参在下次开始录制时自动更新）。开始？')) return
   releaseAll()
   const r = await setLeg(pose)
   cmdError.value = r.ok ? '' : r.msg

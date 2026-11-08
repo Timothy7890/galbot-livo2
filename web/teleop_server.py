@@ -51,7 +51,7 @@ CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
 
 # 躯干升降（leg 关节组 5 个关节，弧度）。环视相机、头部相机、手臂都在躯干上，Mid-360 与 IMU 在底盘上，
-# 升降后相机-雷达外参会变：录制中禁止升降，升降后需重跑 gen_config.py 并重新标定车身轮廓
+# 升降后相机-雷达外参会变：录制中禁止升降（record.sh 每次开始录制会从 SDK 现读外参），升降后需重新标定车身轮廓
 LEG_POSES = {                       # 名称 -> (显示名, 关节角)；stand 来自 Galbot SDK 官方示例
     "low": ("低位", [0.069, 0.234, 0.165, 0.0, 0.0]),
     "mid": ("中位", [0.25, 0.75, 0.5, 0.0, 0.0]),
@@ -219,7 +219,7 @@ class Base:
             while self.leg_target == name:
                 pos = self.leg_positions()
                 if pos and max(abs(a - b) for a, b in zip(pos, goal)) < LEG_TOL:
-                    self.leg_msg = f"已到{label}。录制前请重跑 gen_config.py，并重新标定车身轮廓"
+                    self.leg_msg = f"已到{label}。请重新标定车身轮廓（下次录制会自动更新相机外参）"
                     break
                 if time.time() - t0 > LEG_TIMEOUT:
                     self._leg_hold(f"{LEG_TIMEOUT:.0f} s 未到{label}，已停在当前位置")

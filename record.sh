@@ -11,11 +11,14 @@
 #    ./record.sh status   查看录制状态
 #
 #  每次录制输出到 $DATA_ROOT/<开始时间>/:
-#    raw.bag         Mid-360 点云与 IMU、4 路环视相机 JPEG（供 3DGS 等离线处理）
+#    raw.bag         Mid-360 点云与 IMU、4 路环视 + 2 路头部相机 JPEG（供 3DGS 等离线处理）、
+#                    leg / head 关节角 /galbot/joint_states
 #    map.pcd         FAST-LIVO2 彩色地图（降采样）   map_raw.pcd  未降采样
 #    explore.json  explore_grid.png  2D 栅格与自主建图的过程记录
 #    trajectory.csv  FAST-LIVO2 位姿（IMU 系，10 Hz 以上）   lidar_poses.txt  FAST-LIVO2 原始输出
-#    config/  logs/  info.txt
+#    config/         本次录制开始时由 gen_config.py 从 SDK 现读的标定（FAST-LIVO2 用的就是这份）、
+#                    sensors_all.json（6 路相机内外参与关节角）、FAST-LIVO2 参数
+#    logs/  info.txt（joints_moved=yes 表示录制中躯干 / 头部动过，之后的相机外参与 config/ 不符）
 # ============================================================================
 
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -27,7 +30,7 @@ LOCK_DIR=$RUN_DIR/lock
 PKG_DIR=$PROJECT_DIR/catkin_ws/src/galbot_livo2
 LIVO_PCD_DIR=$PROJECT_DIR/catkin_ws/src/FAST-LIVO2/Log/pcd
 SDK_ENV=$PKG_DIR/scripts/sdk_env.sh
-CAMERAS=(left_front right_front left_rear right_rear)
+CAMERAS=(left_front right_front left_rear right_rear head_left head_right)
 
 mkdir -p "$RUN_DIR" "$DATA_ROOT"
 
@@ -154,14 +157,15 @@ cmd_start() {
         echo "7011 底盘遥控服务未运行，无法自主建图（web/web.sh start）" >&2
         exit 1
     fi
-    if [[ ! -f $PKG_DIR/config/g1_calib.yaml ]]; then
-        echo "缺少标定配置，请先运行 scripts/gen_config.py（见 README）" >&2
-        exit 1
-    fi
+    # 主相机沿用包内 g1_calib.yaml 的设置（gen_config.py --camera 改），没有就用左前
+    local main_cam
+    main_cam=$(awk '/main_camera:/ {print $2; exit}' "$PKG_DIR/config/g1_calib.yaml" 2>/dev/null)
+    main_cam=${main_cam:-left_front}
 
     SESSION="$DATA_ROOT/$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$SESSION/logs" "$SESSION/config"
-    cp "$PKG_DIR"/config/*.yaml "$SESSION/config/"
+    CONF="$SESSION/config"
+    mkdir -p "$SESSION/logs" "$CONF"
+    cp "$PKG_DIR/config/fast_livo2_g1.yaml" "$CONF/"
     export ROS_LOG_DIR="$SESSION/logs/ros"
     rm -f "$PID_FILE" "$STATE_FILE" "$LIVO_PCD_DIR"/*.pcd "$LIVO_PCD_DIR/lidar_poses.txt"
 
@@ -180,13 +184,19 @@ cmd_start() {
         exit 1
     }
 
+    # 相机在躯干上、雷达在底盘上，躯干升降后外参会变：每次录制都从 SDK 现读标定，FAST-LIVO2 用这一份
+    log "从 SDK 读取当前标定（主相机 $main_cam）"
+    "$SDK_ENV" python3 "$PKG_DIR/scripts/gen_config.py" --camera "$main_cam" --out "$CONF" \
+        > "$SESSION/logs/gen_config.log" 2>&1 || fail "生成标定失败（gen_config.py）"
+    grep -E "离地|已写入" "$SESSION/logs/gen_config.log" | sed 's/^/  /'
+
     log "启动 roscore"
     launch roscore roscore
     for ((i = 0; i < 30; i++)); do rostopic list > /dev/null 2>&1 && break; sleep 0.5; done
     rostopic list > /dev/null 2>&1 || fail "roscore 未启动"
-    rosparam load "$PKG_DIR/config/fast_livo2_g1.yaml"
-    rosparam load "$PKG_DIR/config/g1_calib.yaml"
-    rosparam load "$PKG_DIR/config/camera_g1.yaml" /laserMapping
+    rosparam load "$CONF/fast_livo2_g1.yaml"
+    rosparam load "$CONF/g1_calib.yaml"
+    rosparam load "$CONF/camera_g1.yaml" /laserMapping
 
     log "启动 Galbot SDK 桥接"
     launch bridge "$SDK_ENV" rosrun galbot_livo2 sdk_bridge.py
@@ -205,7 +215,7 @@ cmd_start() {
     launch trajectory python3 "$PROJECT_DIR/scripts/record_odom.py" "_output_file:=$SESSION/trajectory.csv"
 
     log "启动原始数据录制"
-    local topics=(/livox/lidar /livox/imu)
+    local topics=(/livox/lidar /livox/imu /galbot/joint_states)
     for c in "${CAMERAS[@]}"; do topics+=("/galbot/$c/image/compressed"); done
     launch rosbag rosbag record -O "$SESSION/raw.bag" "${topics[@]}"
 
@@ -242,8 +252,13 @@ cmd_stop() {
     fi
     mv "$LIVO_PCD_DIR/lidar_poses.txt" "$SESSION/" 2>/dev/null
 
-    local points traj_rows bag_size
+    local points traj_rows bag_size moved=no
     points=$(grep -a -m1 '^POINTS' "$SESSION/map.pcd" 2>/dev/null | awk '{print $2}')
+    # 与 sdk_bridge.py 的 MOVED_WARNING 一致
+    if grep -q "躯干/头部关节在录制中移动" "$SESSION/logs/bridge.log" 2>/dev/null; then
+        moved=yes
+        log "警告: 录制中躯干 / 头部关节动过，之后的相机外参与 config/ 不符（见 logs/bridge.log）"
+    fi
     traj_rows=$(($(wc -l < "$SESSION/trajectory.csv" 2>/dev/null || echo 1) - 1))
     bag_size=$(du -h "$SESSION/raw.bag" 2>/dev/null | cut -f1)
     cat > "$SESSION/info.txt" << EOF
@@ -254,6 +269,7 @@ duration_s=$((end - started))
 bag_size=${bag_size:-无}
 map_points=${points:-0}
 trajectory_poses=$traj_rows
+joints_moved=$moved
 EOF
     rm -f "$STATE_FILE"
     log "已保存到 $SESSION"
