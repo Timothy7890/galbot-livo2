@@ -6,7 +6,7 @@
     GET  /api/live        实时地图 SSE 流（转发录制中的 scripts/live_map.py）
     GET  /api/camera/<名称>.jpg  环视相机最新画面（录制中；默认 320x240 预览，?full=1 原图）
     GET  /api/explore     自主建图状态（转发录制中的 scripts/explorer.py）；/api/explore/grid.png 2D 栅格图
-    POST /api/explore/enable | disable | cancel   进入 / 退出自主建图，取消完成后的自动停止录制
+    POST /api/explore/enable | disable | cancel   进入（可带 {"strategy"}）/ 退出自主建图，取消完成后的自动停止录制
     POST /api/start       开始录制
     POST /api/stop        停止录制（后台执行，状态变为 stopping）
     POST /api/estop       急停：转发给 7011 遥控服务（底盘与躯干只由它控制），锁定后底盘、自主建图、躯干升降都停
@@ -135,7 +135,10 @@ class Handler(BaseHandler):
             last_error.set("" if code == 0 else last_line(out, "启动失败"))
             self.send(200 if code == 0 else 500, {"ok": code == 0, "msg": out})
         elif self.path in ("/api/explore/enable", "/api/explore/disable", "/api/explore/cancel"):
-            req = urllib.request.Request(EXPLORE_URL + self.path.rsplit("/", 1)[1], data=b"", method="POST")
+            # enable 可带 {"strategy": "balanced|nearest|region"}，原样转发
+            body = json.dumps(self.body_json()).encode() if self.path.endswith("/enable") else b""
+            req = urllib.request.Request(EXPLORE_URL + self.path.rsplit("/", 1)[1], data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=5) as r:
                     self.send(r.status, r.read())

@@ -30,6 +30,21 @@ MIN_FRONTIER = 5            # 边界至少这么多格（0.5 m）才算
 SIZE_GAIN = 0.5             # 选目标时每米边界抵消多少米路程
 MIN_GOAL_DIST = 1.0         # 目标至少离机器人这么远 (m)：脚边总有看不清的边界（桌下、车身旁），否则会一直选脚下、原地不动
 
+# 选目标策略（plan 的 strategy）：
+#   balanced 均衡：路程 - SIZE_GAIN × 边界长度，全图挑最划算的（大边界能抵消很远的路程，易在两片区域间来回）
+#   nearest  就近清扫：只看路程，掉头加代价（HEADING_COST），把身边的缺口一路清掉
+#   region   分区清扫：地图按 REGION_SIZE 划块，当前块里还有可达边界就留在块内（离开加 LEAVE_COST），
+#            块内按就近清扫；块扫完才去下一块。采完一片再去另一片，同一区域的图像在时间上集中
+#   在 20261104_002715 的真实地图上离线仿真（4 个起点平均）：回到已离开的 5 m 分区 均衡 12.5 次、就近 10.8、
+#   分区 5.7、顺序 7.2；总路程 均衡 174 m，其余约 146–150 m；但均衡前期覆盖最快（90% 覆盖时路程 40 m，其余 51–60 m）
+#   tour     顺序清扫：把所有边界排成一条最短的访问顺序（开放式旅行商，见 tour_first），去第一个；
+#            自然先清完一头再去另一头
+STRATEGIES = {"balanced": "均衡", "nearest": "就近清扫", "region": "分区清扫", "tour": "顺序清扫"}
+TOUR_DETOUR = 1.3           # 顺序清扫：边界之间实际路程约为直线距离的这么多倍
+HEADING_COST = 3.0          # 目标在正后方时加的路程 (m)，正前方为 0，按 (1 - cos 夹角) / 2 插值
+REGION_SIZE = 10.0          # 分区边长 (m)：与雷达有效距离相当；5 m 太小，块里的边界一下就看清，又满场找下一块
+LEAVE_COST = 15.0           # 分区清扫时去当前块之外的目标加的路程 (m)
+
 FREE, OCC, UNKNOWN = 0, 1, 2
 
 
@@ -161,12 +176,50 @@ def poly_len(pts):
     return float(sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))) * RES
 
 
-def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
+def tour_first(pts, d0):
+    """开放式旅行商：从机器人出发走遍全部边界目标 pts（格坐标）的最短顺序，返回第一个的下标。
+    机器人到各点用实际路程 d0（m），点与点之间用直线距离 × TOUR_DETOUR 近似；最近邻法起步，再 2-opt 改进。"""
+    n = len(pts)
+    p = np.asarray(pts, np.float64) * RES
+    D = np.linalg.norm(p[:, None] - p[None], axis=2) * TOUR_DETOUR
+    d0 = np.asarray(d0, np.float64)
+    order = [int(np.argmin(d0))]
+    left = set(range(n)) - set(order)
+    while left:
+        k = min(left, key=lambda m: D[order[-1], m])
+        order.append(k)
+        left.remove(k)
+
+    def cost(o):
+        return d0[o[0]] + sum(D[a, b] for a, b in zip(o, o[1:]))
+
+    best = cost(order)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                o = order[:i] + order[i:j + 1][::-1] + order[j + 1:]
+                c = cost(o)
+                if c < best - 1e-6:
+                    order, best, improved = o, c, True
+    return order[0]
+
+
+def region_of(xy):
+    """世界坐标 (x, y) 所在分区（整数块号）。"""
+    return int(math.floor(xy[0] / REGION_SIZE)), int(math.floor(xy[1] / REGION_SIZE))
+
+
+def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None,
+         strategy="balanced", heading=None, region=None, origin=(0.0, 0.0)):
     """在状态图 st 上从 start（局部格坐标）出发：
     home 为 None 时找边界目标，否则规划回到 home。
     keep_goal：当前目标，附近仍有边界且可达就继续用它，不每次重新挑（否则目标来回跳、路线扭来扭去、永远到不了）；
     keep_path：当前路线（拐点），仍全线可通行且机器人没偏离就原样保留。
-    返回 dict：goal / path（局部格坐标的拐点列表）、frontiers（[(中心格, 格数)]）、reason。"""
+    strategy：选目标策略（见 STRATEGIES）；heading：机器人朝向 (rad)，就近 / 分区清扫用来少掉头；
+    region：当前分区块号（region_of），分区清扫用；origin：局部格 (0, 0) 中心的世界坐标，用来算分区。
+    返回 dict：goal / path（局部格坐标的拐点列表）、frontiers（[(中心格, 格数)]）、region（目标所在分区）、reason。"""
     h, w = st.shape
     occ = st == OCC
     clear = distance_transform_edt(~occ) * RES                 # 到最近障碍的距离 (m)
@@ -240,6 +293,7 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
         target = [tuple(keep_goal)]
     else:
         best, target = math.inf, None
+        cands = []                  # [(目标格, 路程 m)]，顺序清扫用
         for c in range(1, nlab):
             size = stats[c, cv2.CC_STAT_AREA]
             if size < MIN_FRONTIER:
@@ -253,9 +307,25 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
             cand = np.argwhere(near)
             dd = reach[near]
             j = int(np.argmin(dd))
-            score = dd[j] - SIZE_GAIN * size * RES
+            g = cand[j]
+            if strategy == "balanced":
+                score = dd[j] - SIZE_GAIN * size * RES
+            else:
+                score = dd[j]
+                if heading is not None:
+                    d = g - (si, sj)
+                    n = math.hypot(*d)
+                    if n > 0:
+                        cos = (d[0] * math.cos(heading) + d[1] * math.sin(heading)) / n
+                        score += HEADING_COST * (1 - cos) / 2
+                if strategy == "region" and region is not None:
+                    if region_of((origin[0] + g[0] * RES, origin[1] + g[1] * RES)) != tuple(region):
+                        score += LEAVE_COST
+            cands.append((tuple(int(v) for v in g), float(dd[j])))
             if score < best:
-                best, target = score, [tuple(cand[j])]
+                best, target = score, [tuple(g)]
+        if strategy == "tour" and len(cands) > 1:
+            target = [cands[tour_first([c[0] for c in cands], [c[1] for c in cands])][0]]
         if target is None:
             out["reason"] = "没有可到达的边界" if out["frontiers"] else "没有边界，探索完成"
             return out
@@ -264,6 +334,7 @@ def plan(st, start, blacklist=(), home=None, keep_goal=None, keep_path=None):
     if not (0 <= ti < h and 0 <= tj < w) or not np.isfinite(reach[ti, tj]):
         out["reason"] = "目标不可达"
         return out
+    out["region"] = region_of((origin[0] + ti * RES, origin[1] + tj * RES))
     # 目标没变、原路线仍全线可通行、机器人离路线不远：沿用原路线，避免每秒换一条
     if keep_path and tuple(keep_path[-1]) == (ti, tj) and len(keep_path) >= 2:
         kp = [tuple(p) for p in keep_path]

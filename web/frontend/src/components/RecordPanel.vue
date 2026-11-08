@@ -8,6 +8,14 @@ const props = defineProps({
   explore: { type: Object, default: null },     // 录制中 explorer.py 的状态
 })
 defineEmits(['start', 'toggle-explore', 'stop'])
+const strategy = defineModel('strategy', { type: String, default: 'region' })
+// 选目标策略，与 scripts/explore_grid.py 的 STRATEGIES 对应
+const STRATEGIES = [
+  ['region', '分区清扫', '采完一块（约 10 m × 10 m）再去下一块，来回最少，推荐采集用'],
+  ['tour', '顺序清扫', '把所有缺口排成一条最短路线依次去，少来回'],
+  ['nearest', '就近清扫', '总去最近的缺口、少掉头'],
+  ['balanced', '均衡', '原策略：近且大的边界优先，前期覆盖最快，但常在两片区域间来回'],
+]
 
 const LABEL = {
   connecting: '连接中…',
@@ -55,6 +63,13 @@ const hms = s => [s / 3600, (s / 60) % 60, s % 60].map(v => String(Math.floor(v)
       <button class="go" :disabled="!canStart" @click="$emit('start')">开始录制</button>
       <button class="stop" :disabled="!canStop" @click="$emit('stop')">停止录制</button>
     </div>
+    <label class="strategy">
+      探索策略
+      <select v-model="strategy" :disabled="explore?.enabled">
+        <option v-for="[k, label] in STRATEGIES" :key="k" :value="k">{{ label }}</option>
+      </select>
+    </label>
+    <div class="strategy-hint muted">{{ STRATEGIES.find(s => s[0] === strategy)?.[2] }}</div>
     <button class="explore" :class="{ on: explore?.enabled }" :disabled="state !== 'recording' || !explore"
             @click="$emit('toggle-explore')">
       {{ explore?.enabled ? '退出自主建图' : '进入自主建图（机器人自己走）' }}
@@ -82,7 +97,12 @@ button {
 button:disabled { opacity: 0.35; cursor: default; }
 .go { background: var(--go); }
 .stop { background: var(--stop); }
-.explore { background: #2563eb; width: 100%; margin-top: 10px; flex: none; }
+.explore { background: #2563eb; width: 100%; margin-top: 6px; flex: none; }
+.strategy { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; }
+.strategy select {
+  flex: 1; padding: 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+}
+.strategy-hint { font-size: 12px; margin-top: 4px; }
 .explore.on { background: var(--warn); }
 .meta { font-size: 12px; margin-top: 10px; word-break: break-all; }
 .err { color: var(--stop); font-size: 12px; margin-top: 8px; white-space: pre-wrap; }

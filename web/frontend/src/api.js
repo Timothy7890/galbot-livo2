@@ -15,8 +15,13 @@ export async function getExplore() {
 }
 
 // action：enable 进入自主建图 / disable 退出 / cancel 取消完成后的自动停止录制
-export async function exploreAction(action) {
-  const r = await fetch(`api/explore/${action}`, { method: 'POST' })
+// enable 时 body 为 { strategy }
+export async function exploreAction(action, body) {
+  const r = await fetch(`api/explore/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
   return r.json()
 }
 export const exploreGridUrl = 'api/explore/grid.png'

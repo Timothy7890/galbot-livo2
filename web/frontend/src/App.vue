@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onUnmounted, ref, computed } from 'vue'
+import { onMounted, onUnmounted, ref, computed, watch } from 'vue'
 import { estop, exploreAction, getExplore, getStatus, releaseEstop, startRecording, stopRecording } from './api.js'
 import RecordPanel from './components/RecordPanel.vue'
 import LiveMap from './components/LiveMap.vue'
@@ -15,6 +15,9 @@ let exploreTimer = null
 
 const recording = computed(() => status.value.status === 'recording')
 const explore = ref(null)     // 录制中 explorer.py 的状态（自主建图）
+// 探索策略：记住上次的选择（只是本浏览器的偏好，读写失败就用默认）
+const strategy = ref((() => { try { return localStorage.getItem('exploreStrategy') || 'region' } catch { return 'region' } })())
+watch(strategy, v => { try { localStorage.setItem('exploreStrategy', v) } catch { /* 无痕模式等 */ } })
 
 async function refresh() {
   try {
@@ -38,7 +41,7 @@ async function onToggleExplore() {
     '· 随时可点「退出自主建图」，或按本页 / 7011 遥控页的急停（暂停）/ 按方向键（人工接管，自动退出）\n\n进入？')) return
   actionError.value = ''
   try {
-    const r = await exploreAction(enabled ? 'disable' : 'enable')
+    const r = await exploreAction(enabled ? 'disable' : 'enable', enabled ? null : { strategy: strategy.value })
     if (!r.ok) actionError.value = r.msg
   } catch (e) {
     actionError.value = String(e)
@@ -143,6 +146,7 @@ onUnmounted(() => {
       :action-error="actionError"
       @start="onStart"
       :explore="explore"
+      v-model:strategy="strategy"
       @toggle-explore="onToggleExplore"
       @stop="onStop"
     />

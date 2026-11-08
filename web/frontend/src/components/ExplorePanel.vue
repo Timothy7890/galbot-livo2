@@ -26,6 +26,8 @@ const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2
       </button>
       <div class="meta muted num">
         <template v-if="explore.enabled">用时 {{ mmss(explore.elapsed_s) }} / {{ explore.time_limit_min }} 分 · </template>
+        策略 {{ explore.strategies?.[explore.strategy] || explore.strategy }}
+        <template v-if="explore.region_switches != null"> · 换区 {{ explore.region_switches }} 次</template> ·
         已到达边界 {{ explore.goals_done }} 处 · 剩余 {{ explore.frontiers.length }} 处
         <template v-if="explore.blacklist.length"> · 拉黑 {{ explore.blacklist.length }} 处</template>
         · 限速 {{ explore.v_max }} m/s

@@ -9,12 +9,12 @@
 状态：
     idle      录制中、未进入自主建图：只建栅格，不发任何速度
     spin      刚进入（本次录制第一次）：原地转一圈看清四周
-    explore   选最近、最大的边界（已知可通行与未知的交界）前往
+    explore   按所选策略（分区清扫 / 顺序清扫 / 就近清扫 / 均衡，见 explore_grid.STRATEGIES）选边界（已知可通行与未知的交界）前往
     home      没有可去的边界或超过时长上限：返回录制起点
     countdown 已回到起点、退出自主建图：STOP_COUNTDOWN 秒内没人取消就停止录制
     error     位姿跳变（定位跑飞）等，已退出自主建图，可检查后重新进入
 
-进入 / 退出 / 取消停止：POST /enable、/disable、/cancel（web/server.py 转发自 7010 页面）。
+进入 / 退出 / 取消停止：POST /enable（可带 {"strategy": ...}）、/disable、/cancel（web/server.py 转发自 7010 页面）。
 7011 上有人按方向键（人工接管）立即退出自主建图；7011 急停期间暂停，解除后继续。
 卡住（一段时间几乎没动或一直被避障挡住）：后退一点、把目标拉黑、换下一个。位姿中断则暂停。
 定位监控：FAST-LIVO2 的里程计带数据时间戳（改过的 FAST-LIVO2），位姿比数据落后超过 MAX_POSE_LAG（处理不过来）就暂停等它追上，
@@ -77,6 +77,7 @@ YAW_MAX_DIFF = math.radians(40)     # 窗口内 FAST-LIVO2 与陀螺仪的朝向
 SPIN_WIN, SPIN_ANGLE, SPIN_DIST = 30.0, math.radians(540), 1.0   # 30 s 内实际转了 540° 以上、走了不到 1 m：原地打转
 SPIN_MAX = 3                # 本次进入后打转这么多次就退出
 SCAN_EVERY = 2              # 每 2 帧点云更新一次栅格（5 Hz）
+STRATEGY = os.environ.get("EXPLORE_STRATEGY", "region")   # 默认选目标策略，7010 进入时可另选
 DRY_RUN = os.environ.get("EXPLORE_DRY_RUN") == "1"   # 只算不动：不向 7011 发速度，用于检查流程
 
 
@@ -159,6 +160,9 @@ class Explorer:
         self.blacklist = []         # 卡住而放弃的目标（世界坐标）
         self.visited = []           # 已到达、但旁边的边界仍看不清的目标（世界坐标），不再去
         self.goals_done = 0
+        self.strategy = STRATEGY if STRATEGY in eg.STRATEGIES else "region"
+        self.region = None          # 分区清扫的当前分区（块号）
+        self.region_switches = 0    # 换分区次数（来回跑的程度）
         self.going_home = False
         self.grid_png = b""
         self.grid_meta = None
@@ -264,12 +268,17 @@ class Explorer:
             self.cloud_q = deque(((t, x) for t, x in self.cloud_q if t not in done), maxlen=20)
 
     # ------------------------------------------------------------ 进入 / 退出 / 取消停止（网页调用）
-    def enable(self):
+    def enable(self, strategy=None):
+        if strategy is not None and strategy not in eg.STRATEGIES:
+            return False, f"未知策略 {strategy}"
         with self.lock:
             if self.pose is None:
                 return False, "FAST-LIVO2 还没输出位姿，请稍候"
             if self.enabled:
                 return False, "已在自主建图中"
+            if strategy:
+                self.strategy = strategy
+            self.region, self.region_switches = eg.region_of(self.pose[:2]), 0
             self.enabled, self.stop_at, self.going_home = True, None, False
             self.goal, self.path, self.corners, self.blacklist, self.visited = None, [], [], [], []
             self.corner_idx = []
@@ -277,8 +286,8 @@ class Explorer:
             self.t_enter = time.time()
             self.state = "explore" if self.spun else "spin"
             self.msg = "开始探索" if self.spun else "原地转一圈，先看清四周"
-        rospy.loginfo("进入自主建图")
-        return True, "已进入自主建图"
+        rospy.loginfo("进入自主建图，策略 %s", self.strategy)
+        return True, f"已进入自主建图（{eg.STRATEGIES[self.strategy]}）"
 
     def disable(self, why="已退出自主建图", stop_robot=True):
         with self.lock:
@@ -335,7 +344,9 @@ class Explorer:
             bl = [local(b) for b in self.blacklist + self.visited]
             keep_goal = local(self.goal) if self.goal and enabled else None
             keep_path = [local(c) for c in self.corners] if self.corners and enabled else None
-        res = eg.plan(st, local(pose[:2]), bl, local(self.home) if self.going_home else None, keep_goal, keep_path)
+            strategy, region = self.strategy, self.region
+        res = eg.plan(st, local(pose[:2]), bl, local(self.home) if self.going_home else None, keep_goal, keep_path,
+                      strategy=strategy, heading=pose[2], region=region, origin=tuple(grid.center((i0, j0))))
         with self.lock:
             self.frontiers = [(to_world(c), n) for c, n in res.get("frontiers", [])]
             if not enabled or state not in ("explore", "home") or not self.enabled:
@@ -344,12 +355,15 @@ class Explorer:
                 goal = to_world(res["goal"])
                 if self.goal is not None and goal != self.goal and not self.going_home:
                     self.goals_done += 1        # 原目标附近的边界在路上已经看清，换下一个
+                if not self.going_home and "region" in res and res["region"] != self.region:
+                    self.region = res["region"]
+                    self.region_switches += 1
                 self.corners = [to_world(c) for c in res["path"]]
                 self.path, self.corner_idx = densify(self.corners)
                 self.goal = goal
                 self.msg = (f"返回起点，剩余 {res['length']:.1f} m" if self.going_home
-                            else f"前往第 {self.goals_done + 1} 个边界，路程 {res['length']:.1f} m，"
-                                 f"剩余边界 {len(self.frontiers)} 处")
+                            else f"{eg.STRATEGIES[self.strategy]}：前往第 {self.goals_done + 1} 个边界，"
+                                 f"路程 {res['length']:.1f} m，剩余边界 {len(self.frontiers)} 处")
             elif self.going_home:
                 self.fail(f"无法规划回到起点：{res.get('reason')}")
             else:
@@ -588,7 +602,8 @@ class Explorer:
                 "state": self.state, "msg": self.msg, "enabled": self.enabled,
                 "elapsed_s": round(time.time() - self.t_enter) if self.enabled else None,
                 "stop_in": max(0, round(self.stop_at - time.time())) if self.stop_at else None,
-                "goals_done": self.goals_done, "pose": self.pose and [round(v, 3) for v in self.pose],
+                "goals_done": self.goals_done, "strategy": self.strategy, "strategies": eg.STRATEGIES,
+                "region": self.region, "region_switches": self.region_switches, "pose": self.pose and [round(v, 3) for v in self.pose],
                 "home": self.home and [round(v, 3) for v in self.home], "goal": self.goal,
                 "path": self.corners, "frontiers": self.frontiers,
                 "blacklist": self.blacklist, "visited": self.visited, "grid": self.grid_meta, "cmd": self.cmd,
@@ -626,7 +641,15 @@ def serve(ex):
             action = {"/enable": ex.enable, "/disable": ex.disable, "/cancel": ex.cancel_stop}.get(self.path)
             if action is None:
                 return self.send_error(404)
-            ok, msg = action()
+            if self.path == "/enable":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+                except ValueError:
+                    body = {}
+                ok, msg = ex.enable(body.get("strategy") if isinstance(body, dict) else None)
+            else:
+                ok, msg = action()
             self.reply({"ok": ok, "msg": msg}, code=200 if ok else 409)
 
         def log_message(self, *args):
@@ -645,8 +668,8 @@ def main():
     rospy.Subscriber("/livox/imu", Imu, ex.on_imu, queue_size=400)
     serve(ex)
     threading.Thread(target=ex.plan_loop, daemon=True).start()
-    rospy.loginfo("explorer 启动：限速 %.2f m/s %.2f rad/s，每次时长上限 %.0f 分钟%s", V_MAX, W_MAX, TIME_LIMIT / 60,
-                  "（只算不动）" if DRY_RUN else "")
+    rospy.loginfo("explorer 启动：限速 %.2f m/s %.2f rad/s，每次时长上限 %.0f 分钟，默认策略 %s%s", V_MAX, W_MAX,
+                  TIME_LIMIT / 60, ex.strategy, "（只算不动）" if DRY_RUN else "")
     try:
         ex.run()
     finally:
