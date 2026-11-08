@@ -1,5 +1,5 @@
 <script setup>
-// 4 路环视相机：active 时显示 2x2 预览（320x240，每 0.5 s 一帧），点击某一路放大看原图
+// 头部双目 + 4 路环视相机：active 时显示 2x3 预览（320x240，每 0.5 s 一帧），点击某一路放大看原图
 import { onUnmounted, reactive, ref, watch } from 'vue'
 import { cameraUrl } from '../api.js'
 
@@ -10,6 +10,7 @@ const props = defineProps({
 })
 
 const CAMERAS = [
+  ['head_left', '头部左'], ['head_right', '头部右'],
   ['left_front', '左前'], ['right_front', '右前'],
   ['left_rear', '左后'], ['right_rear', '右后'],
 ]
@@ -53,8 +54,8 @@ function toggle(name) {
 <template>
   <div class="card cams">
     <div class="title">
-      环视相机
-      <span class="muted hint-text">{{ zoomed ? '点击画面返回四路' : '点击某一路放大' }}</span>
+      相机
+      <span class="muted hint-text">{{ zoomed ? '点击画面返回全部' : '点击某一路放大' }}</span>
     </div>
     <div v-if="!active" class="frame empty muted">{{ idleText }}</div>
     <div v-else-if="zoomed" class="frame" @click="toggle(zoomed)">

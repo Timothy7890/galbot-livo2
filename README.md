@@ -46,7 +46,8 @@ roslaunch galbot_livo2 mapping.launch
 web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh autostart 设为开机自启（已设置）
 ```
 
-浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制、实时俯视地图（1.6 m 以下的点，按高度着色）、主相机画面、历史记录。
+浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制、实时俯视地图（1.6 m 以下的点，按高度着色）、头部与环视 6 路相机画面、历史记录。
+页面顶部有急停（空格键同效，手机上固定在顶部）：转发给 7011 遥控服务，与 7011 页面的急停是同一个锁定状态，任一页面都可解除；7011 未运行时急停无效并有提示。
 命令行等价操作：`./record.sh start | stop | status`。每次录制保存在 `~/yx/Data/galbot_livo2/<开始时间>/`：
 
 - `raw.bag`：点云、IMU、4 路环视（10 Hz）与 2 路头部（15 Hz）相机 JPEG、leg / head 关节角 `/galbot/joint_states`（2 Hz），约 90 GB/小时

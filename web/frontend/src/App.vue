@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, onUnmounted, ref, computed } from 'vue'
-import { exploreAction, getExplore, getStatus, startRecording, stopRecording } from './api.js'
+import { estop, exploreAction, getExplore, getStatus, releaseEstop, startRecording, stopRecording } from './api.js'
 import RecordPanel from './components/RecordPanel.vue'
 import LiveMap from './components/LiveMap.vue'
 import SessionList from './components/SessionList.vue'
@@ -35,7 +35,7 @@ async function onToggleExplore() {
   if (!enabled && !confirm('进入自主建图：机器人会自己移动，走遍场地后回到录制起点；' +
     '之后 2 分钟内没人取消就自动停止录制。\n\n' +
     '· 请确认周围没有人和易碎物品，场地出口已关闭\n' +
-    '· 随时可点「退出自主建图」，或在 7011 遥控页按急停（暂停）/ 按方向键（人工接管，自动退出）\n\n进入？')) return
+    '· 随时可点「退出自主建图」，或按本页 / 7011 遥控页的急停（暂停）/ 按方向键（人工接管，自动退出）\n\n进入？')) return
   actionError.value = ''
   try {
     const r = await exploreAction(enabled ? 'disable' : 'enable')
@@ -50,6 +50,34 @@ async function onCancelStop() {
   const r = await exploreAction('cancel')
   if (!r.ok) actionError.value = r.msg
   refreshExplore()
+}
+
+// 急停不确认、立即发；解除需确认
+const estopError = ref('')
+async function onEstop() {
+  estopError.value = ''
+  status.value = { ...status.value, estop: true }
+  try {
+    const r = await estop()
+    if (!r.ok) estopError.value = r.msg || '急停失败'
+  } catch (e) {
+    estopError.value = `急停请求失败：${e}`
+  }
+  refresh()
+}
+async function onReleaseEstop() {
+  if (!confirm('解除急停？\n\n解除后自主建图会继续移动底盘。')) return
+  estopError.value = ''
+  try {
+    const r = await releaseEstop()
+    if (!r.ok) estopError.value = r.msg || '解除失败'
+  } catch (e) {
+    estopError.value = String(e)
+  }
+  refresh()
+}
+function onKeyDown(e) {
+  if (e.key === ' ' && e.target.tagName !== 'INPUT') { e.preventDefault(); onEstop() }
 }
 
 async function onStart() {
@@ -84,16 +112,29 @@ onMounted(() => {
   refresh()
   timer = setInterval(refresh, 2000)
   exploreTimer = setInterval(refreshExplore, 1000)
+  window.addEventListener('keydown', onKeyDown)
 })
-onUnmounted(() => { clearInterval(timer); clearInterval(exploreTimer) })
+onUnmounted(() => {
+  clearInterval(timer); clearInterval(exploreTimer)
+  window.removeEventListener('keydown', onKeyDown)
+})
 </script>
 
 <template>
   <main class="layout">
     <header>
       <h1>Galbot G1 建图录制</h1>
-      <span class="muted">Mid-360 + 环视相机原始数据 · FAST-LIVO2 实时建图</span>
+      <span class="muted">Mid-360 + 环视 / 头部相机原始数据 · FAST-LIVO2 实时建图 · 空格急停</span>
     </header>
+
+    <section class="estop-box">
+      <button v-if="!status.estop" class="estop" @click="onEstop">急停</button>
+      <button v-else class="release" @click="onReleaseEstop">急停中 · 点击解除</button>
+      <div v-if="status.estop === null && status.status !== 'connecting'" class="estop-msg">
+        7011 遥控服务未就绪，急停可能无效
+      </div>
+      <div v-if="estopError" class="estop-msg">{{ estopError }}</div>
+    </section>
 
     <RecordPanel
       class="panel"
@@ -118,8 +159,8 @@ onUnmounted(() => { clearInterval(timer); clearInterval(exploreTimer) })
 .layout {
   display: grid;
   grid-template-columns: 340px 1fr;
-  grid-template-rows: auto auto auto auto 1fr;
-  grid-template-areas: "head head" "panel map" "exp map" "cam map" "list map";
+  grid-template-rows: auto auto auto auto auto 1fr;
+  grid-template-areas: "head head" "estop map" "panel map" "exp map" "cam map" "list map";
   gap: 16px;
   padding: 16px;
   height: 100vh;
@@ -131,13 +172,21 @@ h1 { font-size: 20px; margin: 0; }
 .exp { grid-area: exp; }
 .list { grid-area: list; min-height: 0; overflow: auto; align-self: start; max-height: 100%; }
 .map { grid-area: map; min-height: 0; }
+.estop-box { grid-area: estop; display: flex; flex-direction: column; gap: 6px; }
+.estop, .release {
+  border: 0; border-radius: 12px; padding: 14px; font-size: 20px; font-weight: 700; color: #fff; cursor: pointer;
+}
+.estop { background: var(--stop); }
+.release { background: var(--warn); }
+.estop-msg { color: var(--stop); font-size: 12px; }
 
-/* 手机：录制按钮 → 实时地图 → 主相机 → 历史记录 */
+/* 手机：急停 → 录制按钮 → 实时地图 → 相机 → 历史记录；急停固定在顶部 */
 @media (max-width: 860px) {
+  .estop-box { position: sticky; top: 0; z-index: 10; background: var(--bg); padding: 4px 0; }
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto 70vh auto auto;
-    grid-template-areas: "head" "panel" "exp" "map" "cam" "list";
+    grid-template-rows: auto auto auto auto 70vh auto auto;
+    grid-template-areas: "head" "estop" "panel" "exp" "map" "cam" "list";
     height: auto;
   }
   .list { overflow: visible; max-height: none; }

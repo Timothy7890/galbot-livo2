@@ -9,7 +9,7 @@
     event: snapshot  {"cell", "cells": b64(int16 ix,iy,zcm)*, "traj": [[x,y],...], "pose"}
     event: frame     {"d": b64(新增/升高的格子 int16 ix,iy,zcm), "s": b64(当前帧格子 int16 ix,iy), "p": [x,y,yaw]}
 
-另提供 http://127.0.0.1:7012/camera/<名称>.jpg：4 路环视相机最新一帧。默认是缩小到 1/4（320x240）的
+另提供 http://127.0.0.1:7012/camera/<名称>.jpg：4 路环视与 2 路头部相机最新一帧。默认是缩小到 1/4（320x240）的
 预览图，只在有人请求时才解码缩放，每帧只做一次；加 ?full=1 返回原图。
 """
 import os
@@ -55,7 +55,7 @@ cloud_q = deque(maxlen=10)      # 等位姿的点云 [(数据时间, 雷达系�
 pair_lock = threading.Lock()
 base_in_imu = None          # 底盘在 IMU 系下的 4x4（galbot/imu_in_base 的逆）；地图上的位置和朝向画底盘的
 lidar_in_imu = np.zeros(3)  # 雷达在 IMU 系下的位置（extrin_calib/extrinsic_T，旋转为单位阵）
-CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
+CAMERAS = ("left_front", "right_front", "left_rear", "right_rear", "head_left", "head_right")
 camera_jpg = {}             # 名称 -> 最新原图 JPEG
 camera_thumb = {}           # 名称 -> (原图 JPEG, 预览 JPEG)，按需生成
 CAMERA_PATH = re.compile(r"^/camera/(\w+)\.jpg$")

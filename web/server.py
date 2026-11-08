@@ -9,7 +9,10 @@
     POST /api/explore/enable | disable | cancel   进入 / 退出自主建图，取消完成后的自动停止录制
     POST /api/start       开始录制
     POST /api/stop        停止录制（后台执行，状态变为 stopping）
+    POST /api/estop       急停：转发给 7011 遥控服务（底盘与躯干只由它控制），锁定后底盘、自主建图、躯干升降都停
+    POST /api/estop/release  解除急停（同样转发给 7011）
 """
+import json
 import os
 import re
 import threading
@@ -24,6 +27,7 @@ RECORD_SH = PROJECT_DIR / "record.sh"
 LIVE_URL = "http://127.0.0.1:7012/stream"
 CAMERA_URL = "http://127.0.0.1:7012/camera/"
 EXPLORE_URL = "http://127.0.0.1:7013/"
+TELEOP_URL = "http://127.0.0.1:7011/api/"
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
 CALIB = PROJECT_DIR / "catkin_ws/src/galbot_livo2/config/g1_calib.yaml"
 
@@ -67,7 +71,24 @@ def status_payload():
     st["data_root"] = str(DATA_ROOT)
     st["main_camera"] = main_camera()
     st["sessions"] = list_sessions()
+    st["estop"] = teleop_estop()
     return st
+
+
+def teleop_estop():
+    """7011 的急停状态；7011 未运行或 SDK 未就绪时为 None（急停按钮不可用）。"""
+    try:
+        with urllib.request.urlopen(TELEOP_URL + "status", timeout=2) as r:
+            d = json.loads(r.read())
+        return bool(d.get("estop")) if d.get("sdk_ok") else None
+    except (OSError, ValueError):
+        return None
+
+
+def teleop_post(action):
+    req = urllib.request.Request(TELEOP_URL + action, data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read())
 
 
 def do_stop():
@@ -122,6 +143,12 @@ class Handler(BaseHandler):
                 self.send(e.code, e.read())
             except OSError:
                 self.send(503, {"ok": False, "msg": "未在录制"})
+        elif self.path in ("/api/estop", "/api/estop/release"):
+            try:
+                r = teleop_post("stop" if self.path == "/api/estop" else "release")
+                self.send(200, {"ok": bool(r.get("ok")), "msg": r.get("msg", "")})
+            except (OSError, ValueError) as e:
+                self.send(503, {"ok": False, "msg": f"7011 遥控服务无响应，急停未生效：{e}"})
         elif self.path == "/api/stop":
             if busy.locked():
                 return self.send(409, {"ok": False, "msg": "正在执行其他操作"})

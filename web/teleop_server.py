@@ -4,7 +4,7 @@
     GET  /                  控制页面（web/dist/teleop.html）
     GET  /api/status        SDK 状态、里程计、最近一次指令结果
     GET  /api/scan          避障用的障碍点、8 个超声波读数、限速明细（网页俯视图）
-    GET  /api/camera/<名称>.jpg  环视相机最新画面（默认 320x240 预览，?full=1 原图）
+    GET  /api/camera/<名称>.jpg  环视与头部相机最新画面（默认 320x240 预览，?full=1 原图）
     POST /api/cmd           {"vx", "vy", "wz", "safe", "source"} 速度指令，网页按住期间、自主探索（explorer.py）运行期间
                             每 0.1 s 发一次；返回上一周期实际下发的速度、避障原因和其他来源最近一次指令距今多久
                             （others，自主探索据此判断人工接管）。底盘只由本服务控制，急停对两者都有效
@@ -47,7 +47,9 @@ ACC_V, DEC_V = 0.4, 0.8     # 线加速度、减速度 (m/s²)
 ACC_W, DEC_W = 1.0, 2.0     # 角加速度、减速度 (rad/s²)
 RATE = 10            # 下发频率 (Hz)
 CAL_FRAMES = 20      # 车身自标定采集帧数（约 2 s）
-CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
+# 网页预览的相机：名称 -> SDK SensorType 名
+CAMERAS = {c: f"{c.upper()}_SURROUND_CAMERA" for c in ("left_front", "right_front", "left_rear", "right_rear")}
+CAMERAS.update(head_left="HEAD_LEFT_CAMERA", head_right="HEAD_RIGHT_CAMERA")
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
 
 # 躯干升降（leg 关节组 5 个关节，弧度）。环视相机、头部相机、手臂都在躯干上，Mid-360 与 IMU 在底盘上，
@@ -126,7 +128,7 @@ class Base:
         try:
             from galbot_sdk import g1
             robot = g1.GalbotRobot()
-            sensors = {getattr(g1.SensorType, f"{c.upper()}_SURROUND_CAMERA") for c in CAMERAS}
+            sensors = {getattr(g1.SensorType, s) for s in CAMERAS.values()}
             sensors |= {g1.SensorType.BASE_LIDAR, g1.SensorType.BASE_ULTRASONIC}
             if not robot.init(sensors):
                 raise RuntimeError("GalbotRobot.init 失败")
@@ -407,7 +409,7 @@ class Base:
     def camera(self, name, full):
         if self.robot is None or name not in CAMERAS:
             return None
-        d = self.robot.get_rgb_data(getattr(self.g1.SensorType, f"{name.upper()}_SURROUND_CAMERA"))
+        d = self.robot.get_rgb_data(getattr(self.g1.SensorType, CAMERAS[name]))
         jpg = d.get("data") if d else None
         if not jpg or full:
             return jpg

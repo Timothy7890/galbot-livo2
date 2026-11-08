@@ -26,5 +26,15 @@ export async function stopRecording() {
   return r.json()
 }
 
+// 急停 / 解除：经 7010 转发给 7011 遥控服务
+export async function estop() {
+  const r = await fetch('api/estop', { method: 'POST' })
+  return r.json()
+}
+export async function releaseEstop() {
+  const r = await fetch('api/estop/release', { method: 'POST' })
+  return r.json()
+}
+
 export const liveUrl = 'api/live'
 export const cameraUrl = name => `api/camera/${name}.jpg`
