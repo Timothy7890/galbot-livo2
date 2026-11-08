@@ -57,6 +57,7 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 - 底盘 600 x 600 mm（投影圆 625 mm）。手臂等伸出底盘时，在四周 0.8 m 内空旷处点「标定车身轮廓」，结果存 `catkin_ws/src/galbot_livo2/config/self_mask.json`
 - 速度以 `duration=0` 10 Hz 持续下发（SDK 的 `set_base_velocity` 带 duration 会阻塞整个时长且不释放 GIL，实测 0.5 s → 卡住整个进程 520 ms）；看门狗 `web/base_watchdog.py` 读心跳 `/dev/shm/galbot_teleop_heartbeat`，7011 崩溃或卡住 0.6 s 以上且在动就 `stop_base`；输出按加减速限制平顺变化；松手立即减速停车，0.5 s 没收到新指令（切走页面、断线）开始减速，1 s 强制 `stop_base`
 - 急停会锁定，解除前忽略一切速度指令；默认限速 0.5 m/s、1.0 rad/s（`web/teleop_server.py`）
+- 躯干高度：低位 / 中位 / 站立三档（`LEG_POSES`，leg 关节组，0.1 rad/s）。录制中、底盘运动中不可用，升降期间底盘指令被拒绝；急停时停止关节轨迹并停在当前位置（不用 `stop_controller`，否则躯干可能下坠）。环视与头部相机在躯干上、Mid-360 在底盘上，升降后需重新标定车身轮廓
 
 ## 自主建图（录制中在 7010 点「进入自主建图」）
 

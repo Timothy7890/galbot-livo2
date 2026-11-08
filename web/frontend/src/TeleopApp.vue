@@ -2,7 +2,7 @@
 // 底盘遥控：按住按钮或键盘（W/S 前后、A/D 横移、Q/E 转向、空格急停）期间每 0.1 s 发一次速度指令，
 // 松手立即平顺减速停车；切走页面、断线时服务端 0.5 s 内开始减速、1 s 内强制停车
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { calibrate, estop, getStatus, release, sendCmd } from './teleopApi.js'
+import { calibrate, estop, getStatus, release, sendCmd, setLeg } from './teleopApi.js'
 import CameraView from './components/CameraView.vue'
 import ObstacleView from './components/ObstacleView.vue'
 
@@ -71,6 +71,16 @@ async function onCalibrate() {
     '请先确认机器人四周 0.8 m 内没有任何障碍物和人，否则障碍物会被当成机器人的一部分。开始？')) return
   const r = await calibrate()
   cmdError.value = r.ok ? '' : r.msg
+}
+
+async function onLeg(pose, label) {
+  if (!confirm(`躯干升降到「${label}」：关节速度 0.1 rad/s，约 10–20 s。\n\n` +
+    '请确认机器人周围（尤其上方和手臂附近）没有人和障碍物，并随时准备点急停（急停会让躯干停在当前位置）。\n' +
+    '升降后相机与雷达的相对位置会变：录制前需重跑 gen_config.py，并重新标定车身轮廓。开始？')) return
+  releaseAll()
+  const r = await setLeg(pose)
+  cmdError.value = r.ok ? '' : r.msg
+  refresh()
 }
 
 function onSafeChange(e) {
@@ -170,6 +180,21 @@ const fmt = (v, d = 2) => (v == null ? '-' : Number(v).toFixed(d))
         {{ status.calibrating ? '标定中…' : '标定车身轮廓' }}
       </button>
       <div v-if="status.calib_msg" class="muted calib-msg">{{ status.calib_msg }}</div>
+
+      <div class="leg">
+        <div class="leg-head">躯干高度
+          <span class="muted">{{ status.leg_target ? '升降中…' : status.leg_pose ? status.leg_poses?.[status.leg_pose] : status.leg ? '自定义' : '-' }}</span>
+        </div>
+        <div class="leg-btns">
+          <button v-for="(label, k) in status.leg_poses || {}" :key="k" class="calib"
+                  :class="{ cur: status.leg_pose === k }"
+                  :disabled="!status.sdk_ok || status.estop || status.moving || status.calibrating || !!status.leg_target || status.recording"
+                  @click="onLeg(k, label)">{{ label }}</button>
+        </div>
+        <div class="muted calib-msg num">关节 {{ status.leg ? status.leg.map(v => v.toFixed(2)).join(' / ') : '-' }}</div>
+        <div v-if="status.recording" class="muted calib-msg">录制中不能升降</div>
+        <div v-if="status.leg_msg" class="muted calib-msg">{{ status.leg_msg }}</div>
+      </div>
     </section>
 
     <section class="card info">
@@ -212,6 +237,10 @@ h1 { font-size: 20px; margin: 0; }
 }
 .calib:disabled { opacity: 0.4; cursor: default; }
 .calib-msg { font-size: 12px; }
+.leg { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+.leg-head { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; }
+.leg-btns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.calib.cur { border-color: var(--go); color: var(--go); font-weight: 600; }
 td.warn { color: var(--warn); font-weight: 600; }
 .state { display: flex; align-items: center; gap: 10px; font-size: 16px; }
 .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--warn); }

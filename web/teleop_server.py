@@ -11,6 +11,7 @@
     POST /api/stop          急停（锁定，之后的速度指令一律忽略）
     POST /api/release       解除急停
     POST /api/calibrate     车身自标定：静止采 CAL_FRAMES 帧 Mid-360，记录机器人自身（手臂等），见 safety.py
+    POST /api/leg           {"pose": "low|mid|stand"} 躯干升降到预设姿态（LEG_POSES），录制中、底盘运动中拒绝；急停会停在当前位置
 
 安全：
 - 速度以 duration=0 下发（不阻塞）。SDK 的 set_base_velocity 带 duration 时会阻塞整个时长且不释放 GIL，
@@ -48,6 +49,27 @@ RATE = 10            # 下发频率 (Hz)
 CAL_FRAMES = 20      # 车身自标定采集帧数（约 2 s）
 CAMERAS = ("left_front", "right_front", "left_rear", "right_rear")
 CAMERA_PATH = re.compile(r"^/api/camera/(\w+)\.jpg$")
+
+# 躯干升降（leg 关节组 5 个关节，弧度）。环视相机、头部相机、手臂都在躯干上，Mid-360 与 IMU 在底盘上，
+# 升降后相机-雷达外参会变：录制中禁止升降，升降后需重跑 gen_config.py 并重新标定车身轮廓
+LEG_POSES = {                       # 名称 -> (显示名, 关节角)；stand 来自 Galbot SDK 官方示例
+    "low": ("低位", [0.069, 0.234, 0.165, 0.0, 0.0]),
+    "mid": ("中位", [0.25, 0.75, 0.5, 0.0, 0.0]),
+    "stand": ("站立", [0.5, 1.5, 1.0, 0.0, 0.0]),
+}
+LEG_SPEED = 0.1      # 关节最大速度 (rad/s)，官方示例同为 0.1
+LEG_TOL = 0.02       # 到位判定 (rad)
+LEG_TIMEOUT = 60.0   # 等待到位上限 (s)
+RECORD_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run", "state")
+
+
+def recording():
+    """record.sh 正在录制（state 文件里 status=recording/starting/stopping）。"""
+    try:
+        with open(RECORD_STATE) as f:
+            return any(line.strip() in ("status=recording", "status=starting", "status=stopping") for line in f)
+    except OSError:
+        return False
 
 
 def beat(moving):
@@ -88,6 +110,8 @@ class Base:
         self.calib = None           # 车身自标定进行中时为已采集的帧列表
         self.last_by_source = {}    # 来源 -> 最近一次非零指令的时间
         self.calib_msg = ""
+        self.leg_target = None      # 升降进行中时为目标姿态名称
+        self.leg_msg = ""
 
     def ensure_sdk(self):
         """开机自启时 Galbot 服务可能还没就绪，SDK 第一次用到时再初始化，失败下次重试。"""
@@ -124,6 +148,8 @@ class Base:
                 return False, "急停中，请先解除"
             if self.calib is not None:
                 return False, "车身标定中，请稍候"
+            if self.leg_target is not None:
+                return False, "躯干升降中，底盘暂停"
             now = time.time()
             self.target = (clamp(vx, MAX_V), clamp(vy, MAX_V), clamp(wz, MAX_W), bool(safe), now, str(source)[:16])
             if any(self.target[:3]):
@@ -142,6 +168,8 @@ class Base:
                 self.estop = True
         with self.sdk_lock:
             self._halt("急停" if latch else "停止")
+        if latch and self.leg_target is not None:
+            self._leg_hold("急停：躯干已停在当前位置")
 
     def release(self):
         with self.lock:
@@ -155,6 +183,67 @@ class Base:
             self.calib = []
             self.calib_msg = "标定中…"
         return True, "开始标定，约 2 s，期间请勿靠近机器人"
+
+    # ------------------------------------------------------------ 躯干升降
+    def leg_positions(self):
+        try:
+            return [round(x, 3) for x in self.robot.get_joint_positions(["leg"])]
+        except Exception:      # noqa: BLE001
+            return None
+
+    def start_leg(self, name):
+        if name not in LEG_POSES:
+            return False, "未知姿态"
+        if recording():
+            return False, "正在录制，升降会改变相机与雷达的相对位置，请先停止录制"
+        with self.lock:
+            if self.estop:
+                return False, "急停中，请先解除"
+            if self.moving or self.calib is not None or self.leg_target is not None:
+                return False, "底盘在动、正在标定或正在升降"
+            if self.target and time.time() - self.target[4] < HALT_AFTER and any(self.target[:3]):
+                return False, "底盘刚收到速度指令，请先松手停车"
+            self.target = None
+            self.leg_target = name
+            self.leg_msg = f"正在移动到{LEG_POSES[name][0]}…"
+        threading.Thread(target=self._leg_run, args=(name,), daemon=True).start()
+        return True, self.leg_msg
+
+    def _leg_run(self, name):
+        label, goal = LEG_POSES[name]
+        try:
+            st = self.robot.set_joint_positions(goal, ["leg"], [], False, LEG_SPEED, LEG_TIMEOUT)
+            if str(st).split(".")[-1] not in ("SUCCESS", "IN_PROGRESS"):
+                raise RuntimeError(f"SDK 返回 {st}")
+            t0 = time.time()
+            while self.leg_target == name:
+                pos = self.leg_positions()
+                if pos and max(abs(a - b) for a, b in zip(pos, goal)) < LEG_TOL:
+                    self.leg_msg = f"已到{label}。录制前请重跑 gen_config.py，并重新标定车身轮廓"
+                    break
+                if time.time() - t0 > LEG_TIMEOUT:
+                    self._leg_hold(f"{LEG_TIMEOUT:.0f} s 未到{label}，已停在当前位置")
+                    break
+                time.sleep(0.1)
+        except Exception as e:      # noqa: BLE001
+            self._leg_hold(f"升降失败：{e}")
+        finally:
+            with self.lock:
+                if self.leg_target == name:
+                    self.leg_target = None
+
+    def _leg_hold(self, why):
+        """停止关节轨迹并以当前位置为目标保持（不用 stop_controller：关节失去控制，躯干可能下坠）。"""
+        with self.lock:
+            self.leg_target = None
+        try:
+            self.robot.stop_trajectory_execution()
+            pos = self.leg_positions()
+            if pos:
+                self.robot.set_joint_positions(pos, ["leg"], [], False, LEG_SPEED, 5.0)
+        except Exception as e:      # noqa: BLE001
+            why += f"（停止调用异常：{e}）"
+        self.leg_msg = why
 
     def _halt(self, why):
         """调用方需持有 sdk_lock。"""
@@ -291,8 +380,15 @@ class Base:
               "applied": self.applied, "calibrating": self.calib is not None, "calib_msg": self.calib_msg,
               "source": self.target[5] if self.target else "",
               "sdk_ms_p90": round(sorted(self.sdk_ms)[int(len(self.sdk_ms) * 0.9)], 1) if self.sdk_ms else None}
+        st.update({"leg_target": self.leg_target, "leg_msg": self.leg_msg, "recording": recording(),
+                   "leg_poses": {k: v[0] for k, v in LEG_POSES.items()}})
         if self.robot is None:
             return st
+        leg = self.leg_positions()
+        st["leg"] = leg
+        if leg:
+            k, (label, q) = min(LEG_POSES.items(), key=lambda kv: max(abs(a - b) for a, b in zip(leg, kv[1][1])))
+            st["leg_pose"] = k if max(abs(a - b) for a, b in zip(leg, q)) < LEG_TOL * 2 else ""
         odom = self.robot.get_odom()
         if odom:
             qx, qy, qz, qw = odom["orientation"]
@@ -369,12 +465,15 @@ class Handler(BaseHandler):
         elif self.path == "/api/calibrate":
             ok, msg = base.start_calibration()
             self.send(200 if ok else 409, {"ok": ok, "msg": msg})
+        elif self.path == "/api/leg":
+            ok, msg = base.start_leg(str(self.body_json().get("pose", "")))
+            self.send(200 if ok else 409, {"ok": ok, "msg": msg})
         else:
             self.send(404, {"error": "not found"})
 
     def log_message(self, fmt, *args):
         line = str(args[0] if args else "")
-        if any(p in line for p in ("/api/stop", "/api/release")):
+        if any(p in line for p in ("/api/stop", "/api/release", "/api/leg")):
             super().log_message(fmt, *args)
 
 
