@@ -149,12 +149,13 @@ class Bridge:
         while not rospy.is_shutdown():
             t0 = time.time()
             try:
-                names, pos = [], []
+                names, pos, ready = [], [], True
                 for g in POSE_JOINT_GROUPS:
                     q = list(self.robot.get_joint_positions([g]))
+                    ready &= bool(q)   # 刚初始化时可能只有部分关节组有数据，等齐了再发，参考值才完整
                     names += [f"{g}_joint{i + 1}" for i in range(len(q))]
                     pos += q
-                if pos:
+                if ready:
                     msg.header.stamp = rospy.Time.now()
                     msg.name, msg.position = names, pos
                     self.pub_joints.publish(msg)

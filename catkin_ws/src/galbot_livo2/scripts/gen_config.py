@@ -65,13 +65,13 @@ def all_sensors(robot, T_b_l, T_b_i):
            "joints": {}, "cameras": {}}
     for g in POSE_JOINT_GROUPS:
         try:
-            out["joints"][g] = [round(x, 4) for x in robot.get_joint_positions([g])]
+            out["joints"][g] = [round(x, 4) for x in wait_for(lambda: robot.get_joint_positions([g]))]
         except Exception as e:      # noqa: BLE001  SDK 抛出的异常类型不固定
             out["joints"][g] = f"读取失败：{e}"
     for name, s in ALL_CAMERAS.items():
         try:
             T_b_c = pose_in_base(robot, s)
-            intr = robot.get_camera_intrinsic(s)
+            intr = wait_for(lambda: robot.get_camera_intrinsic(s))
             out["cameras"][name] = {
                 "width": intr["width"], "height": intr["height"], "model": intr["distortion_model"],
                 "K": [round(x, 6) for x in intr["K"]], "D": list(intr["D"]),
@@ -96,7 +96,7 @@ def main():
     robot = open_robot({LIDAR, IMU, *ALL_CAMERAS.values()})
     try:
         T_b_l, T_b_i, T_b_c = (pose_in_base(robot, s) for s in (LIDAR, IMU, cam))
-        intr = robot.get_camera_intrinsic(cam)
+        intr = wait_for(lambda: robot.get_camera_intrinsic(cam))   # 刚初始化时返回空字典
         lidar = wait_for(lambda: robot.get_lidar_data(LIDAR)) if args.overlay else None
         jpg = wait_for(lambda: robot.get_rgb_data(cam)) if args.overlay else None
         sensors = all_sensors(robot, T_b_l, T_b_i)
