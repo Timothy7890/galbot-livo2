@@ -127,6 +127,7 @@ onUnmounted(() => {
   <main class="layout">
     <header>
       <h1>Galbot G1 建图录制</h1>
+      <a class="navlink" href="nav.html">导航 →</a>
       <span class="muted">Mid-360 + 环视 / 头部相机原始数据 · FAST-LIVO2 实时建图 · 空格急停</span>
     </header>
 
@@ -171,6 +172,7 @@ onUnmounted(() => {
 }
 header { grid-area: head; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 h1 { font-size: 20px; margin: 0; }
+.navlink { color: #3b82f6; font-weight: 600; }
 .panel { grid-area: panel; }
 .cam { grid-area: cam; }
 .exp { grid-area: exp; }

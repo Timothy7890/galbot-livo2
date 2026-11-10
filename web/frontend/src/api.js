@@ -43,3 +43,19 @@ export async function releaseEstop() {
 
 export const liveUrl = 'api/live'
 export const cameraUrl = name => `api/camera/${name}.jpg`
+
+// 导航（成熟地图）
+export async function getNav() {
+  const r = await fetch('api/nav')
+  return r.json()
+}
+// action：start {session} / stop / goto {x, y} / cancel / reloc {mode, x, y, yaw} / build {session, name}
+export async function navAction(action, body) {
+  const r = await fetch(`api/nav/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  })
+  try { return await r.json() } catch { return { ok: false, msg: `HTTP ${r.status}` } }
+}
+export const navGridUrl = session => (session ? `api/nav/grid.png?session=${session}` : 'api/nav/grid.png')

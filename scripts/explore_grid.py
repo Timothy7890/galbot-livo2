@@ -47,6 +47,31 @@ LEAVE_COST = 15.0           # 分区清扫时去当前块之外的目标加的�
 
 FREE, OCC, UNKNOWN = 0, 1, 2
 
+# 导航地图的 3D 定位点云：录制时（explorer.py）与重放 raw.bag 时（nav_map.py）都按 CLOUD_VOXEL 体素计数
+CLOUD_VOXEL = 0.10
+CLOUD_RANGE = 25.0          # 只记这么远以内的点（远处稀、误差大）
+_OFF = 1 << 20
+
+
+def voxel_keys(pts, voxel=CLOUD_VOXEL):
+    """世界系点 Nx3 → 去重的体素键（int64）。"""
+    iv = np.floor(pts / voxel).astype(np.int64)
+    return np.unique(((iv[:, 0] + _OFF) << 42) | ((iv[:, 1] + _OFF) << 21) | (iv[:, 2] + _OFF))
+
+
+def voxel_centers(keys, voxel=CLOUD_VOXEL):
+    k = np.asarray(keys, np.int64)
+    iv = np.stack([(k >> 42) - _OFF, ((k >> 21) & (2 * _OFF - 1)) - _OFF, (k & (2 * _OFF - 1)) - _OFF], 1)
+    return (iv + 0.5) * voxel
+
+
+def merge_counts(keys, counts, new_keys, new_counts=None):
+    """体素键计数合并：new_keys 每个记 1 次（或 new_counts 次）。"""
+    allk = np.concatenate([keys, new_keys])
+    allc = np.concatenate([counts, np.ones(len(new_keys), np.int64) if new_counts is None else new_counts])
+    uk, inv = np.unique(allk, return_inverse=True)
+    return uk, np.bincount(inv, weights=allc).astype(np.int64)
+
 
 class Grid:
     def __init__(self, floor_z):

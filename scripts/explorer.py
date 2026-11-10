@@ -117,6 +117,9 @@ def away_from_obstacle(speed):
 
 
 class Explorer:
+    HOME_LABEL = "起点"        # 消息里 home 的叫法；导航（navigator.py）复用本类时为"目标"
+    COLLECT_CLOUD = True        # 录制时累积导航地图用的 3D 点云；导航（navigator.py）不存地图，关掉
+
     def __init__(self):
         p = rospy.get_param("galbot/imu_in_base")
         self.T_b_i = np.eye(4)
@@ -138,6 +141,11 @@ class Explorer:
         self.odom_hist = deque(maxlen=60)   # [(数据时间, IMU 位姿 4x4)]，点云按时间配对
         self.cloud_q = deque(maxlen=20)     # 等位姿的点云 [(数据时间, 雷达系点)]
         self.integ_lock = threading.Lock()
+        # 导航地图用的 3D 点云：与栅格同一批点（已配好位姿），按体素计帧数。每帧只去重、存起来，
+        # 合并放在后台线程（cloud_loop）里做，不阻塞回调
+        self.cloud_batches = []
+        self.cloud_lock = threading.Lock()
+        self.cloud_keys, self.cloud_counts = np.empty(0, np.int64), np.empty(0, np.int64)
         self.pose = None            # 底盘 (x, y, yaw)
         self.home = None            # 录制起点
         self.scan_n = 0
@@ -260,7 +268,12 @@ class Explorer:
                 if abs(best[0] - (ts + 0.1)) < 0.06:
                     T = best[1]
                     pl = xyz + self.t_i_l                           # 雷达系 → IMU 系
-                    self.grid.integrate(T[:3, :3] @ self.t_i_l + T[:3, 3], pl @ T[:3, :3].T + T[:3, 3])
+                    w = pl @ T[:3, :3].T + T[:3, 3]
+                    self.grid.integrate(T[:3, :3] @ self.t_i_l + T[:3, 3], w)
+                    if self.COLLECT_CLOUD:
+                        near = np.einsum("ij,ij->i", xyz, xyz) < eg.CLOUD_RANGE ** 2
+                        with self.cloud_lock:
+                            self.cloud_batches.append(eg.voxel_keys(w[near]))
                     self.grid.mark_free_disk((T @ self.T_i_b)[:2, 3])
                     done.append(ts)
                 elif ts + 0.1 < self.odom_hist[-1][0] - 0.5:
@@ -361,11 +374,11 @@ class Explorer:
                 self.corners = [to_world(c) for c in res["path"]]
                 self.path, self.corner_idx = densify(self.corners)
                 self.goal = goal
-                self.msg = (f"返回起点，剩余 {res['length']:.1f} m" if self.going_home
+                self.msg = (f"前往{self.HOME_LABEL}，剩余 {res['length']:.1f} m" if self.going_home
                             else f"{eg.STRATEGIES[self.strategy]}：前往第 {self.goals_done + 1} 个边界，"
                                  f"路程 {res['length']:.1f} m，剩余边界 {len(self.frontiers)} 处")
             elif self.going_home:
-                self.fail(f"无法规划回到起点：{res.get('reason')}")
+                self.fail(f"无法规划到{self.HOME_LABEL}：{res.get('reason')}")
             else:
                 self.going_home, self.path, self.goal = True, [], None
                 self.state, self.msg = "home", f"{res.get('reason')}，返回起点"
@@ -595,6 +608,40 @@ class Explorer:
         if self.grid_png:
             with open(os.path.join(self.session, "explore_grid.png"), "wb") as f:
                 f.write(self.grid_png)
+        self.save_grid()
+
+    def merge_cloud(self):
+        with self.cloud_lock:
+            batches, self.cloud_batches = self.cloud_batches, []
+        if batches:
+            k, c = eg.merge_counts(self.cloud_keys, self.cloud_counts, np.concatenate(batches))
+            with self.cloud_lock:
+                self.cloud_keys, self.cloud_counts = k, c
+
+    def cloud_loop(self):
+        while not rospy.is_shutdown():
+            time.sleep(10)
+            try:
+                self.merge_cloud()
+            except Exception as e:      # noqa: BLE001
+                rospy.logerr("点云合并异常：%s", e)
+
+    def save_grid(self):
+        """栅格计数存为 explore_grid.npz（裁到已观测区域）、3D 点云体素计数存为 explore_cloud.npz，
+        生成导航地图（scripts/nav_map.py）直接用，不必重读 raw.bag。"""
+        self.merge_cloud()
+        if self.session and len(self.cloud_keys):
+            tmp = os.path.join(self.session, "explore_cloud.tmp.npz")
+            np.savez_compressed(tmp, keys=self.cloud_keys, counts=self.cloud_counts, voxel=eg.CLOUD_VOXEL)
+            os.replace(tmp, os.path.join(self.session, "explore_cloud.npz"))
+        grid = self.grid
+        if grid is None or grid.bbox is None:
+            return
+        i0, i1, j0, j1 = grid.bbox
+        tmp = os.path.join(self.session, "explore_grid.tmp.npz")
+        np.savez_compressed(tmp, hits=grid.hits[i0:i1, j0:j1], free=grid.free[i0:i1, j0:j1], i0=i0, j0=j0,
+                            n=grid.n, res=eg.RES, floor_z=grid.floor_z)
+        os.replace(tmp, os.path.join(self.session, "explore_grid.npz"))
 
     def snapshot(self, full=False):
         with self.lock:
@@ -668,6 +715,7 @@ def main():
     rospy.Subscriber("/livox/imu", Imu, ex.on_imu, queue_size=400)
     serve(ex)
     threading.Thread(target=ex.plan_loop, daemon=True).start()
+    threading.Thread(target=ex.cloud_loop, daemon=True).start()
     rospy.loginfo("explorer 启动：限速 %.2f m/s %.2f rad/s，每次时长上限 %.0f 分钟，默认策略 %s%s", V_MAX, W_MAX,
                   TIME_LIMIT / 60, ex.strategy, "（只算不动）" if DRY_RUN else "")
     try:

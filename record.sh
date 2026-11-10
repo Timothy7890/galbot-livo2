@@ -145,6 +145,10 @@ cmd_start() {
         echo "已在录制中: $(state_get session)" >&2
         exit 1
     fi
+    if [[ -n $("$PROJECT_DIR/nav.sh" status | grep -v status=idle) ]]; then
+        echo "导航正在运行，请先停止导航（7010 导航页或 ./nav.sh stop）" >&2
+        exit 1
+    fi
     if rostopic list > /dev/null 2>&1; then
         echo "检测到已有 ROS 在运行（可能是手动启动的 mapping.launch），请先关闭" >&2
         exit 1
