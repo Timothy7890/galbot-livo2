@@ -63,7 +63,7 @@ stop_proc() {
     log "  $name 未在 ${timeout}s 内退出，强制结束"
     kill -KILL -- "-$pid" 2>/dev/null
 }
-wait_topic() { timeout "$2" rostopic echo -n 1 "$1/header/stamp" > /dev/null 2>&1; }
+ROS_TOOL="python3 $PROJECT_DIR/scripts/ros_tool.py"     # 一个进程加载全部参数 / 等多个话题
 any_alive() {
     local _ p
     [[ -f $PID_FILE ]] || return 1
@@ -101,7 +101,7 @@ cmd_start() {
         echo "正在录制，导航与录制不能同时进行" >&2
         exit 1
     fi
-    if rostopic list > /dev/null 2>&1; then
+    if timeout 1 bash -c '</dev/tcp/127.0.0.1/11311' 2> /dev/null; then
         echo "检测到已有 ROS 在运行，请先关闭" >&2
         exit 1
     fi
@@ -128,28 +128,24 @@ cmd_start() {
         exit 1
     }
 
-    log "从 SDK 读取当前标定"
+    log "读取标定、启动 ROS（同时进行）"
+    launch roscore roscore
     "$SDK_ENV" python3 "$PKG_DIR/scripts/gen_config.py" --camera "$main_cam" --out "$CONF" \
         > "$LOG_DIR/gen_config.log" 2>&1 || fail "生成标定失败（gen_config.py）"
     cp "$PKG_DIR/config/fast_livo2_g1.yaml" "$CONF/"
-
-    log "启动 roscore"
-    launch roscore roscore
-    for ((i = 0; i < 30; i++)); do rostopic list > /dev/null 2>&1 && break; sleep 0.5; done
-    rostopic list > /dev/null 2>&1 || fail "roscore 未启动"
-    rosparam load "$CONF/fast_livo2_g1.yaml"
-    rosparam load "$CONF/g1_calib.yaml"
-    rosparam load "$CONF/camera_g1.yaml" /laserMapping
-    rosparam set /pcd_save/pcd_save_en false      # 导航不存地图（长时间运行也不累积点云）
+    # 导航不存地图（长时间运行也不累积点云）
+    sed -i 's/^\([[:space:]]*pcd_save_en:[[:space:]]*\)true/\1false/' "$CONF/fast_livo2_g1.yaml"
+    $ROS_TOOL load "$CONF/fast_livo2_g1.yaml" "$CONF/g1_calib.yaml" "$CONF/camera_g1.yaml:/laserMapping" \
+        > "$LOG_DIR/params.log" 2>&1 || fail "roscore 未启动或加载参数失败"
 
     log "启动 Galbot SDK 桥接（只发主相机）"
     launch bridge "$SDK_ENV" rosrun galbot_livo2 sdk_bridge.py _publish_all_cameras:=false _publish_head_cameras:=false
-    wait_topic /livox/lidar 20 || fail "未收到雷达点云 /livox/lidar"
-    wait_topic /livox/imu 10 || fail "未收到 IMU 数据 /livox/imu"
+    local miss
+    miss=$($ROS_TOOL wait 30 /livox/lidar /livox/imu /galbot/camera/image) || fail "传感器没有数据：${miss:-超时}"
 
     log "启动 FAST-LIVO2"
     launch fastlivo rosrun fast_livo fastlivo_mapping __name:=laserMapping
-    wait_topic /aft_mapped_to_init 30 || fail "FAST-LIVO2 未输出里程计 /aft_mapped_to_init"
+    miss=$($ROS_TOOL wait 30 /aft_mapped_to_init) || fail "FAST-LIVO2 未输出里程计 /aft_mapped_to_init"
 
     log "启动导航程序$([[ ${NAV_DRY_RUN:-} == 1 ]] && echo "（只算不动）")"
     export EXPLORE_V=${NAV_V:-0.3} EXPLORE_W=${NAV_W:-0.6} NAV_DRY_RUN=${NAV_DRY_RUN:-}

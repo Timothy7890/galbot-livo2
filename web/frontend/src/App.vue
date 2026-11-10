@@ -10,6 +10,8 @@ import ExplorePanel from './components/ExplorePanel.vue'
 const status = ref({ status: 'connecting', sessions: [] })
 const pending = ref('')       // 本地操作进行中的提示
 const actionError = ref('')
+const startFail = ref(null)   // 启动失败时停在哪一步，录制面板标出来；下次操作时清掉
+let lastStart = null          // 启动中最后一次看到的进度
 let timer = null
 let exploreTimer = null
 
@@ -22,9 +24,19 @@ watch(strategy, v => { try { localStorage.setItem('exploreStrategy', v) } catch 
 async function refresh() {
   try {
     status.value = await getStatus()
+    if (status.value.status === 'starting') {
+      lastStart = { step: status.value.step || '', elapsed: Number(status.value.elapsed_s ?? 0),
+                    stepElapsed: Number(status.value.step_elapsed_s ?? 0) }
+    }
   } catch {
     status.value = { ...status.value, status: 'offline' }
   }
+}
+
+// 启动中 0.5 s 刷新一次（显示进度），平时 2 s
+function schedule() {
+  const fast = pending.value === 'starting' || status.value.status === 'starting'
+  timer = setTimeout(async () => { await refresh(); schedule() }, fast ? 500 : 2000)
 }
 
 // 自主建图状态单独每秒刷新一次（录制状态 2 s 一次即可）
@@ -86,10 +98,18 @@ function onKeyDown(e) {
 async function onStart() {
   pending.value = 'starting'
   actionError.value = ''
+  startFail.value = null
+  lastStart = null
   explore.value = null
   try {
     const r = await startRecording()
-    if (!r.ok) actionError.value = r.msg
+    if (!r.ok) {
+      actionError.value = r.msg
+      // record.sh 的输出最后一行是"启动失败: 原因（日志见 ...）"
+      const line = String(r.msg || '').split('\n').reverse().find(l => l.includes('启动失败')) || String(r.msg || '').split('\n').pop()
+      startFail.value = { ...(lastStart || { step: '', elapsed: 0, stepElapsed: 0 }),
+                          msg: line.replace(/^\[[\d:]+\]\s*/, '').replace(/^启动失败[:：]\s*/, '') }
+    }
   } catch (e) {
     actionError.value = String(e)
   }
@@ -99,6 +119,7 @@ async function onStart() {
 
 async function onStop() {
   if (!confirm('停止录制并保存？')) return
+  startFail.value = null
   pending.value = 'stopping'
   actionError.value = ''
   try {
@@ -113,12 +134,12 @@ async function onStop() {
 
 onMounted(() => {
   refresh()
-  timer = setInterval(refresh, 2000)
+  schedule()
   exploreTimer = setInterval(refreshExplore, 1000)
   window.addEventListener('keydown', onKeyDown)
 })
 onUnmounted(() => {
-  clearInterval(timer); clearInterval(exploreTimer)
+  clearTimeout(timer); clearInterval(exploreTimer)
   window.removeEventListener('keydown', onKeyDown)
 })
 </script>
@@ -145,6 +166,7 @@ onUnmounted(() => {
       :status="status"
       :pending="pending"
       :action-error="actionError"
+      :start-fail="startFail"
       @start="onStart"
       :explore="explore"
       v-model:strategy="strategy"

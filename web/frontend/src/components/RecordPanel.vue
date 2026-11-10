@@ -1,11 +1,13 @@
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue'
+import StartProgress from './StartProgress.vue'
 
 const props = defineProps({
   status: { type: Object, required: true },
   pending: { type: String, default: '' },
   actionError: { type: String, default: '' },
   explore: { type: Object, default: null },     // 录制中 explorer.py 的状态
+  startFail: { type: Object, default: null },   // 上次启动失败停在哪一步 { step, elapsed, msg }
 })
 defineEmits(['start', 'toggle-explore', 'stop'])
 const strategy = defineModel('strategy', { type: String, default: 'region' })
@@ -58,7 +60,12 @@ const hms = s => [s / 3600, (s / 60) % 60, s % 60].map(v => String(Math.floor(v)
 <template>
   <div class="card panel" :class="state">
     <div class="status"><span class="dot" />{{ LABEL[state] || state }}</div>
-    <div class="timer num">{{ hms(elapsed) }}</div>
+    <StartProgress v-if="state === 'starting'" :step="status.step || ''"
+                   :step-elapsed="status.step_elapsed_s != null ? Number(status.step_elapsed_s) : null"
+                   :elapsed="status.elapsed_s != null ? Number(status.elapsed_s) : null" />
+    <StartProgress v-else-if="startFail && state === 'idle'" :step="startFail.step" :elapsed="startFail.elapsed"
+                   :step-elapsed="startFail.stepElapsed" failed :failed-msg="startFail.msg" />
+    <div v-else class="timer num">{{ hms(elapsed) }}</div>
     <div class="btns">
       <button class="go" :disabled="!canStart" @click="$emit('start')">开始录制</button>
       <button class="stop" :disabled="!canStop" @click="$emit('stop')">停止录制</button>
@@ -77,7 +84,7 @@ const hms = s => [s / 3600, (s / 60) % 60, s % 60].map(v => String(Math.floor(v)
     <div v-if="status.session" class="meta muted">
       保存到 {{ status.session }}<template v-if="status.size">（{{ status.size }}）</template>
     </div>
-    <div v-if="actionError || status.error" class="err">{{ actionError || status.error }}</div>
+    <div v-if="(actionError || status.error) && !startFail" class="err">{{ actionError || status.error }}</div>
   </div>
 </template>
 

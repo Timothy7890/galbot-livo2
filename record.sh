@@ -88,9 +88,26 @@ stop_proc() {
     kill -KILL -- "-$pid" 2>/dev/null
 }
 
-wait_topic() {
-    local topic=$1 timeout=$2
-    timeout "$timeout" rostopic echo -n 1 "$topic/header/stamp" > /dev/null 2>&1
+ROS_TOOL="python3 $PROJECT_DIR/scripts/ros_tool.py"
+# roscore 是否在运行：直接试连 11311 端口（rostopic list 要起一次 Python，1 秒多）
+ros_running() { timeout 1 bash -c '</dev/tcp/127.0.0.1/11311' 2> /dev/null; }
+
+# 启动进度：网页（7010）轮询 status 显示到第几步；各步耗时记在 logs/start_timing.log
+START_STEPS=6
+STEP_T0=0
+STEP_NAME=""
+step() {
+    local i=$1 text=$2 now
+    now=$(date +%s.%N)
+    if [[ -n $STEP_NAME ]]; then
+        printf '%-28s %5.1f s\n' "$STEP_NAME" "$(echo "$now - $STEP_T0" | awk '{print $1 - $3}')" >> "$SESSION/logs/start_timing.log"
+    fi
+    STEP_T0=$now
+    STEP_NAME=$text
+    [[ $i -gt 0 ]] || return 0
+    state_set step "$i/$START_STEPS $text"
+    state_set step_t "$(date +%s)"
+    log "[$i/$START_STEPS] $text"
 }
 
 is_recording() { [[ $(state_get status) == recording || $(state_get status) == stopping ]]; }
@@ -149,7 +166,7 @@ cmd_start() {
         echo "导航正在运行，请先停止导航（7010 导航页或 ./nav.sh stop）" >&2
         exit 1
     fi
-    if rostopic list > /dev/null 2>&1; then
+    if ros_running; then
         echo "检测到已有 ROS 在运行（可能是手动启动的 mapping.launch），请先关闭" >&2
         exit 1
     fi
@@ -188,31 +205,27 @@ cmd_start() {
         exit 1
     }
 
-    # 相机在躯干上、雷达在底盘上，躯干升降后外参会变：每次录制都从 SDK 现读标定，FAST-LIVO2 用这一份
-    log "从 SDK 读取当前标定（主相机 $main_cam）"
-    "$SDK_ENV" python3 "$PKG_DIR/scripts/gen_config.py" --camera "$main_cam" --out "$CONF" \
-        > "$SESSION/logs/gen_config.log" 2>&1 || fail "生成标定失败（gen_config.py）"
-    grep -E "离地|已写入" "$SESSION/logs/gen_config.log" | sed 's/^/  /'
-
-    log "启动 roscore"
+    # 相机在躯干上、雷达在底盘上，躯干升降后外参会变：每次录制都从 SDK 现读标定，FAST-LIVO2 用这一份。
+    # roscore 与读标定互不依赖，同时进行
+    step 1 "读取标定、启动 ROS"
     launch roscore roscore
-    for ((i = 0; i < 30; i++)); do rostopic list > /dev/null 2>&1 && break; sleep 0.5; done
-    rostopic list > /dev/null 2>&1 || fail "roscore 未启动"
-    rosparam load "$CONF/fast_livo2_g1.yaml"
-    rosparam load "$CONF/g1_calib.yaml"
-    rosparam load "$CONF/camera_g1.yaml" /laserMapping
+    "$SDK_ENV" python3 "$PKG_DIR/scripts/gen_config.py" --camera "$main_cam" --out "$CONF" \
+        > "$SESSION/logs/gen_config.log" 2>&1 || fail "生成标定失败（gen_config.py，见 logs/gen_config.log）"
+    grep -E "离地|已写入" "$SESSION/logs/gen_config.log" | sed 's/^/  /'
+    $ROS_TOOL load "$CONF/fast_livo2_g1.yaml" "$CONF/g1_calib.yaml" "$CONF/camera_g1.yaml:/laserMapping" \
+        > "$SESSION/logs/params.log" 2>&1 || fail "roscore 未启动或加载参数失败（见 logs/params.log）"
 
-    log "启动 Galbot SDK 桥接"
+    step 2 "启动传感器桥接（Galbot SDK）"
     launch bridge "$SDK_ENV" rosrun galbot_livo2 sdk_bridge.py
-    wait_topic /livox/lidar 20 || fail "未收到雷达点云 /livox/lidar"
-    wait_topic /livox/imu 10 || fail "未收到 IMU 数据 /livox/imu"
-    wait_topic /galbot/camera/image 10 || fail "未收到主相机图像 /galbot/camera/image"
+    step 3 "等待雷达、IMU、相机数据"
+    local miss
+    miss=$($ROS_TOOL wait 30 /livox/lidar /livox/imu /galbot/camera/image) || fail "传感器没有数据：${miss:-超时}"
 
-    log "启动 FAST-LIVO2 实时建图"
+    step 4 "启动 FAST-LIVO2 实时建图"
     launch fastlivo rosrun fast_livo fastlivo_mapping __name:=laserMapping
-    wait_topic /aft_mapped_to_init 30 || fail "FAST-LIVO2 未输出里程计 /aft_mapped_to_init"
+    miss=$($ROS_TOOL wait 30 /aft_mapped_to_init) || fail "FAST-LIVO2 未输出里程计 /aft_mapped_to_init"
 
-    log "启动网页实时地图推送"
+    step 5 "开始录包、轨迹与实时地图"
     launch live nice -n 10 python3 "$PROJECT_DIR/scripts/live_map.py"
 
     log "启动轨迹记录"
@@ -224,9 +237,12 @@ cmd_start() {
     launch rosbag rosbag record -O "$SESSION/raw.bag" "${topics[@]}"
 
     # 自主建图程序随录制启动：平时只建 2D 栅格，进入自主建图后才控制底盘
-    log "启动自主建图程序$($explore && echo "（立即进入）")"
+    step 6 "启动自主建图程序$($explore && echo "（立即进入）")"
     launch explorer python3 "$PROJECT_DIR/scripts/explorer.py" "_session:=$SESSION" "_auto_start:=$explore"
 
+    step 0 ""
+    printf '%-28s %5d s\n' "合计" "$(($(date +%s) - $(state_get started)))" >> "$SESSION/logs/start_timing.log"
+    sed -i '/^step/d' "$STATE_FILE"
     state_set status recording
     log "录制中。停止请运行: $0 stop"
 }
@@ -299,6 +315,12 @@ cmd_status() {
     echo "status=$status"
     echo "session=$session"
     echo "elapsed_s=$((now - started))"
+    if [[ $status == starting ]]; then
+        echo "step=$(state_get step)"
+        local st
+        st=$(state_get step_t)
+        echo "step_elapsed_s=$((now - ${st:-$now}))"
+    fi
     echo "size=$(du -sh "$session" 2>/dev/null | cut -f1)"
 }
 

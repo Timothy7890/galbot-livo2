@@ -48,9 +48,14 @@ web/web.sh start       # 启动 7010 录制与 7011 底盘遥控；web/web.sh au
 
 浏览器打开 `http://<HPU>:7010`（本机经 ssh 转发为 17710）：开始/停止录制（导航运行时不能录制）、实时俯视地图（1.6 m 以下的点，按高度着色）、头部与环视 6 路相机画面、历史记录。
 页面顶部有急停（空格键同效，手机上固定在顶部）：转发给 7011 遥控服务，与 7011 页面的急停是同一个锁定状态，任一页面都可解除；7011 未运行时急停无效并有提示。
+点开始录制后页面显示启动进度（读标定与启动 ROS → 传感器桥接 → 等传感器数据 → FAST-LIVO2 → 录包 → 自主建图程序），
+当前步骤已用时间、失败时停在哪一步和原因；各步耗时记在录制目录 `logs/start_timing.log`。
+以前约 26 s，主要是 SDK 初始化两次（读标定、桥接各一次，约 13 s）和反复起 `rosparam` / `rostopic`（每次 1 秒多）；
+现在 roscore 与读标定同时启动，参数加载和等话题各用一个进程（`scripts/ros_tool.py`）。
 命令行等价操作：`./record.sh start | stop | status`。每次录制保存在 `~/yx/Data/galbot_livo2/<开始时间>/`：
 
 - `raw.bag`：点云、IMU、4 路环视（10 Hz）与 2 路头部（15 Hz）相机 JPEG、leg / head 关节角 `/galbot/joint_states`（2 Hz），约 90 GB/小时
+- `logs/start_timing.log`：启动各步耗时
 - `config/`：开始录制时从 SDK 现读的标定（`g1_calib.yaml`、`camera_g1.yaml`、`sensors_all.json`）与 FAST-LIVO2 参数
 - `info.txt`：`joints_moved=yes` 表示录制中躯干 / 头部动过，之后的相机外参与 `config/` 不符（见 `logs/bridge.log`）
 - `map.pcd`（5 cm 降采样彩色地图）、`map_raw.pcd`、`trajectory.csv`、`lidar_poses.txt`、`logs/`（`bridge.log` 每 10 s 记各路帧数与丢帧）
