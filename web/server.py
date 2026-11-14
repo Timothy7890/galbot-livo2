@@ -19,7 +19,8 @@
     GET  /api/nav/traj?session=<录制>   建图轨迹 [[x, y], ...]
     POST /api/nav/build       {"session", "name"} 由录制生成导航地图（后台，进度在录制列表的 nav_progress）
     POST /api/nav/start       {"session", "vision", "dry_run"} 启动导航（后台，立即返回，进度看 /api/nav）；/api/nav/stop 停止（后台）
-    POST /api/nav/goto {"x","y"[,"yaw"]} | cancel | reloc {"mode", "x","y","yaw"} | confirm | speed {"v"} | heartbeat
+    POST /api/nav/plan {"x","y"[,"yaw"]}（只规划，路线给人看）→ go（确认出发）| goto（规划并立即出发，网页不用）|
+              cancel | reloc {"mode", "x","y","yaw"} | confirm | speed {"v"} | heartbeat
                               转发给 navigator（7014）
 状态里的 stale：本服务启动后 server.py / webcommon.py 又被更新而没重启，页面据此提示。
 """
@@ -348,8 +349,8 @@ class Handler(BaseHandler):
             nav_error.set("")
             threading.Thread(target=nav_run, args=(nav_op["op"], *args), daemon=True).start()
             self.send(202, {"ok": True, "msg": "正在启动导航" if starting else "正在停止导航"})
-        elif self.path in ("/api/nav/goto", "/api/nav/cancel", "/api/nav/reloc", "/api/nav/confirm",
-                           "/api/nav/speed", "/api/nav/heartbeat"):
+        elif self.path in ("/api/nav/goto", "/api/nav/plan", "/api/nav/go", "/api/nav/cancel", "/api/nav/reloc",
+                           "/api/nav/confirm", "/api/nav/speed", "/api/nav/heartbeat"):
             self.proxy_post(NAV_URL + self.path.rsplit("/", 1)[1], self.body_json(), "导航未运行")
         elif self.path == "/api/stop":
             if busy.locked():

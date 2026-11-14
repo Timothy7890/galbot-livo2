@@ -113,9 +113,12 @@ function draw() {
   if (st.loc?.state !== 'localized') {
     for (const c of st.loc?.candidates || []) arrow(ctx, c.x, c.y, c.yaw, 'rgba(250,204,21,0.6)', 0.8)
   }
-  if (st.enabled) {
-    polyline(ctx, st.path, '#22c55e', 3)
-    const t = st.target
+  // 待确认的路线：绿色虚线（还没出发）；出发后的路线：绿色实线。有待确认的路线时只画它，免得两条线混在一起
+  const pend = st.pending
+  if (pend) polyline(ctx, pend.path, '#22c55e', 3, [10, 7])
+  else if (st.enabled) polyline(ctx, st.path, '#22c55e', 3)
+  if (pend || st.enabled) {
+    const t = pend ? pend.target : st.target
     if (t) {
       const [sx, sy] = w2s(t[0], t[1])
       ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
@@ -290,7 +293,7 @@ defineExpose({ fitAll })
       <canvas ref="canvasEl" @wheel="onWheel" @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp"
               @pointercancel="onUp" />
       <div v-if="!gridUrl" class="hint">选一张导航地图</div>
-      <div v-if="mode === 'goal'" class="tip goal">点一下白色区域选目标；按住拖动可指定到点后的车头朝向 · Esc 取消</div>
+      <div v-if="mode === 'goal'" class="tip goal">点一下白色区域选目标（先出路线，确认后才走）；按住拖动可指定到点后的车头朝向 · Esc 取消</div>
       <div v-if="mode === 'reloc'" class="tip reloc">在机器人实际所在处按下，朝车头方向拖动后松开 · Esc 取消</div>
       <div class="legend">
         <span><i class="sw" style="background:rgba(255,255,255,0.55)" />可通行</span>

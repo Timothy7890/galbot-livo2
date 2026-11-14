@@ -151,12 +151,14 @@ async function reloc(body) {
 }
 const autoReloc = () => reloc({ mode: 'auto' })
 const cancel = () => act('cancel')
+const pending = computed(() => state.value?.pending || null)
+const go = () => act('go')
 const setSpeed = () => act('speed', { v: speed.value })
 
 async function onPick(p) {
   const m = mode.value
   mode.value = ''
-  if (m === 'goal') await act('goto', p)
+  if (m === 'goal') await act('plan', p)     // 只规划：路线画出来，等人确认后才出发
   else if (m === 'reloc') await reloc({ mode: 'manual', ...p })
 }
 
@@ -295,10 +297,18 @@ onUnmounted(() => {
           <div v-if="state?.limit_reason" class="warn small">避障：{{ state.limit_reason }}</div>
           <div v-if="state?.teleop_msg" class="bad small">{{ state.teleop_msg }}</div>
           <div class="muted small num">当前速度 {{ curSpeed.toFixed(2) }} m/s</div>
+          <div v-if="pending" class="check go-check">
+            <b>确认路线</b>
+            <div class="small">地图上绿色虚线是规划的路线，{{ pending.msg }}。确认后机器人才会出发。</div>
+            <div class="btns">
+              <button class="go" :disabled="!!nav.estop" @click="go">确认出发</button>
+              <button @click="cancel">取消</button>
+            </div>
+          </div>
           <div class="btns">
-            <button class="go" :disabled="!confirmed || !!nav.estop" :class="{ active: mode === 'goal' }"
+            <button :disabled="!confirmed || !!nav.estop" :class="{ active: mode === 'goal', go: !pending }"
                     @click="mode = mode === 'goal' ? '' : 'goal'">
-              {{ mode === 'goal' ? '取消点选' : navigating ? '换个目标' : '选目标' }}
+              {{ mode === 'goal' ? '取消点选' : (navigating || pending) ? '换个目标' : '选目标' }}
             </button>
             <button :disabled="!navigating" @click="cancel">取消导航</button>
           </div>
@@ -315,6 +325,11 @@ onUnmounted(() => {
 
     <section class="map">
       <NavMap :grid-url="gridUrl" :grid="grid" :state="state" :traj="traj" :mode="mode" @pick="onPick" />
+      <div v-if="pending && !mode" class="go-bar">
+        <span>已规划路线，{{ pending.msg }}</span>
+        <button class="go" :disabled="!!nav.estop" @click="go">确认出发</button>
+        <button @click="cancel">取消</button>
+      </div>
     </section>
   </main>
 </template>
@@ -328,7 +343,15 @@ header { grid-area: head; display: flex; align-items: baseline; gap: 12px; flex-
 h1 { font-size: 20px; margin: 0; }
 a { color: #3b82f6; }
 .side { grid-area: side; display: flex; flex-direction: column; gap: 12px; overflow: auto; min-height: 0; }
-.map { grid-area: map; min-height: 0; }
+.map { grid-area: map; min-height: 0; position: relative; }
+.go-bar {
+  position: absolute; left: 50%; top: 58px; transform: translateX(-50%); z-index: 5; max-width: calc(100% - 40px);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center;
+  background: var(--card); border: 2px solid var(--go); border-radius: 12px; padding: 8px 12px; font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.go-bar button { padding: 7px 16px; }
+.check.go-check { border-color: var(--go); }
 .card { display: flex; flex-direction: column; gap: 8px; }
 .title { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .estop-box { display: flex; flex-direction: column; gap: 6px; }

@@ -16,7 +16,10 @@
 
 HTTP（127.0.0.1:7014，web/server.py 转发自 7010 /api/nav/...）：
     GET  /state  /grid.png    /stream（SSE，每 0.2 s 一个 state 事件，网页用它，不再每秒轮询）
-    POST /goto {"x", "y"[, "yaw"]}   目标离障碍太近时挪到 GOAL_SNAP_R 内最近的可通行处；给了 yaw 则到点后原地转到该朝向
+    POST /plan {"x", "y"[, "yaw"]}   只规划、不动：路线放在状态的 pending 里（网页画出来给人看），等 /go
+    POST /go                  人看过路线、确认后出发（按 pending 的目标从当前位置重新规划）；/cancel 也会清掉 pending
+    POST /goto {"x", "y"[, "yaw"]}   规划并立即出发（命令行 / 仿真用；网页走 /plan + /go，不会一点就动）。
+                              目标离障碍太近时挪到 GOAL_SNAP_R 内最近的可通行处；给了 yaw 则到点后原地转到该朝向
     POST /cancel     /reloc {"mode": "auto"} 或 {"mode": "manual", "x", "y", "yaw"}（重定位进行中、排队中的重复请求一律拒绝）
     POST /confirm             人核对过自动重定位的结果（自动重定位后必须核对才能选目标；手动点选的不用；
                               启动时在上次停止的位置附近定位成功的，视为已核对）
@@ -103,6 +106,7 @@ class Navigator(explorer.Explorer):
         self.loc_ms = None
         self.target = None              # [x, y] 或 [x, y, yaw]
         self.target_yaw = None          # 到点后要转到的朝向（没指定为 None）
+        self.pending = None             # 规划好、等人确认的路线 {target, path, length, msg}
         self.final_turn_t0 = None
         self.auto_retries = 0
         self.hb_t = None                # 最近一次网页心跳；None = 没有网页在发（命令行 / 仿真），不检查
@@ -229,6 +233,7 @@ class Navigator(explorer.Explorer):
         startup = bool(req.get("startup"))
         if self.enabled:
             self.disable("重新定位，已停止导航")
+        self.pending = None             # 位置要变了，之前规划的路线作废
         self.set_loc(state="relocalizing", msg="手动重定位中…" if manual else "自动重定位中…")
         lev, T_ol = self.level_scan(LOC_WINDOW)
         if lev is None:
@@ -329,16 +334,59 @@ class Navigator(explorer.Explorer):
             out.append(ij[roomy[0]])
         return [to_world(c) for c in out]
 
+    def plan_only(self, x, y, yaw=None):
+        """只规划、不出发：结果放进 self.pending，网页画出路线，人确认后再 go()。"""
+        ok, msg, plan = self._plan(x, y, yaw)
+        with self.lock:
+            self.pending = None
+            if ok:
+                x, y, res, corners, note = plan
+                self.pending = {"target": [round(float(x), 3), round(float(y), 3)] + ([round(float(yaw), 3)] if yaw is not None else []),
+                                "path": corners, "length": round(res["length"], 1),
+                                "msg": f"路程约 {res['length']:.1f} m{note}", "t": round(time.time(), 1)}
+                msg = f"路线已规划，路程约 {res['length']:.1f} m{note}；看过路线后点「确认出发」"
+        return ok, msg
+
+    def go(self):
+        with self.lock:
+            p = self.pending
+        if p is None:
+            return False, "没有待确认的路线，请先选目标"
+        t = p["target"]
+        return self.goto(t[0], t[1], t[2] if len(t) > 2 else None)
+
     def goto(self, x, y, yaw=None):
+        ok, msg, plan = self._plan(x, y, yaw)
+        if not ok:
+            return False, msg
+        x, y, res, corners, note = plan
+        with self.lock:
+            self.pending = None
+            self.home = (float(x), float(y))
+            self.target = [round(float(x), 3), round(float(y), 3)] + ([round(float(yaw), 3)] if yaw is not None else [])
+            self.target_yaw, self.final_turn_t0 = (float(yaw) if yaw is not None else None), None
+            self.going_home, self.enabled, self.stop_at = True, True, None
+            # 路线直接用上面规划的，不等规划线程下一轮（最多 1 s）
+            self.goal, self.corners = corners[-1], corners
+            self.path, self.corner_idx = explorer.densify(corners) if len(corners) > 1 else ([], [])
+            self.blacklist, self.visited = [], []
+            self.feedback = {}
+            self.t_enter = time.time()
+            self.state, self.msg = "home", f"前往目标，路程约 {res['length']:.1f} m{note}"
+        rospy.loginfo("前往目标 (%.2f, %.2f)，路程约 %.1f m%s", x, y, res["length"], note)
+        return True, self.msg
+
+    def _plan(self, x, y, yaw=None):
+        """规划到 (x, y)。返回 (ok, msg, (x, y, res, 拐点世界坐标, 吸附说明))。"""
         with self.lock:
             if self.T_mo is None or self.loc.get("state") != "localized":
-                return False, "还没定位，先定位再选目标"
+                return False, "还没定位，先定位再选目标", None
             if not self.confirmed:
-                return False, "请先核对自动定位的结果（地图上的机器人位置与朝向对不对）"
+                return False, "请先核对自动定位的结果（地图上的机器人位置与朝向对不对）", None
             pose = self.pose
             grid = self.grid
         if pose is None:
-            return False, "还没有地图系位姿"
+            return False, "还没有地图系位姿", None
         st, (i0, j0) = grid.state()
         local = lambda xy: tuple(int(v) for v in grid.cell(xy) - (i0, j0))
         to_world = lambda ij: tuple(np.round(grid.center(np.asarray(ij) + (i0, j0)), 3).tolist())
@@ -353,22 +401,9 @@ class Navigator(explorer.Explorer):
                     res, (x, y) = r2, alt
                     break
         if "path" not in res:
-            return False, f"去不了这里：{res.get('reason')}（附近 {GOAL_SNAP_R:.0f} m 内没有能到的白色可通行区域）"
+            return False, f"去不了这里：{res.get('reason')}（附近 {GOAL_SNAP_R:.0f} m 内没有能到的白色可通行区域）", None
         corners = [to_world(c) for c in res["path"]]
-        with self.lock:
-            self.home = (float(x), float(y))
-            self.target = [round(float(x), 3), round(float(y), 3)] + ([round(float(yaw), 3)] if yaw is not None else [])
-            self.target_yaw, self.final_turn_t0 = (float(yaw) if yaw is not None else None), None
-            self.going_home, self.enabled, self.stop_at = True, True, None
-            # 路线直接用上面规划的，不等规划线程下一轮（最多 1 s）
-            self.goal, self.corners = to_world(res["goal"]), corners
-            self.path, self.corner_idx = explorer.densify(corners) if len(corners) > 1 else ([], [])
-            self.blacklist, self.visited = [], []
-            self.feedback = {}
-            self.t_enter = time.time()
-            self.state, self.msg = "home", f"前往目标，路程约 {res['length']:.1f} m{note}"
-        rospy.loginfo("前往目标 (%.2f, %.2f)，路程约 %.1f m%s", x, y, res["length"], note)
-        return True, self.msg
+        return True, "", (x, y, res, corners, note)
 
     def follow(self, pose):
         """到点后若指定了车头朝向，先原地转过去再算到达。"""
@@ -397,7 +432,11 @@ class Navigator(explorer.Explorer):
         return True, self.msg
 
     def cancel(self):
+        with self.lock:
+            had, self.pending = self.pending is not None, None
         ok, msg = self.disable("已取消导航")
+        if not ok:
+            return (True, "已取消待确认的路线") if had else (False, "没有在导航，也没有待确认的路线")
         return ok, msg
 
     def request_reloc(self, body):
@@ -486,7 +525,7 @@ class Navigator(explorer.Explorer):
         with self.lock:
             s.update(loc=dict(self.loc), target=self.target, map=self.meta, loc_ms=self.loc_ms, confirmed=self.confirmed,
                      odom_pose=self.odom_pose and [round(v, 3) for v in self.odom_pose],
-                     reloc_pending=self.loc_req is not None or not self.auto_tried,
+                     reloc_pending=self.loc_req is not None or not self.auto_tried, pending=self.pending,
                      last_pose=self.last_pose)
         s.update(dry_run=explorer.DRY_RUN, scan=self.scan_b64, scan_unit=SCAN_UNIT, grid_v=self.grid_v,
                  v_range=list(V_RANGE), robot_r=eg.ROBOT_R,
@@ -539,6 +578,11 @@ def serve(nv):
                 if self.path == "/goto":
                     yaw = body.get("yaw")
                     ok, msg = nv.goto(float(body["x"]), float(body["y"]), None if yaw is None else float(yaw))
+                elif self.path == "/plan":
+                    yaw = body.get("yaw")
+                    ok, msg = nv.plan_only(float(body["x"]), float(body["y"]), None if yaw is None else float(yaw))
+                elif self.path == "/go":
+                    ok, msg = nv.go()
                 elif self.path == "/speed":
                     ok, msg = nv.set_speed(body["v"])
                 elif self.path == "/heartbeat":
