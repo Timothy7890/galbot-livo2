@@ -38,8 +38,11 @@ mkdir -p "$RUN_DIR" "$DATA_ROOT"
 # 去掉 conda，避免 rospy 节点用到 conda 里的 python
 PATH=$(echo "$PATH" | tr ':' '\n' | grep -viE 'conda' | paste -sd: -)
 unset PYTHONPATH CONDA_PREFIX
-source /opt/ros/noetic/setup.bash
-source "$PROJECT_DIR/catkin_ws/devel/setup.bash"
+# status 只读状态文件，不需要 ROS 环境：网页每 0.5–2 s 查一次，省掉两次 source（机器忙时各要零点几秒）
+if [[ ${1:-} != status ]]; then
+    source /opt/ros/noetic/setup.bash
+    source "$PROJECT_DIR/catkin_ws/devel/setup.bash"
+fi
 export ROS_MASTER_URI=http://localhost:11311
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }

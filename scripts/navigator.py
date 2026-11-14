@@ -15,15 +15,23 @@
 定位（loc.state）：unlocalized / relocalizing / localized / lost（连续跟踪失败，正在导航则停车）
 
 HTTP（127.0.0.1:7014，web/server.py 转发自 7010 /api/nav/...）：
-    GET  /state  /grid.png
-    POST /goto {"x", "y"}     /cancel     /reloc {"mode": "auto"} 或 {"mode": "manual", "x", "y", "yaw"}
-    POST /confirm             人核对过自动重定位的结果（自动重定位后必须核对才能选目标；手动点选的不用）
+    GET  /state  /grid.png    /stream（SSE，每 0.2 s 一个 state 事件，网页用它，不再每秒轮询）
+    POST /goto {"x", "y"[, "yaw"]}   目标离障碍太近时挪到 GOAL_SNAP_R 内最近的可通行处；给了 yaw 则到点后原地转到该朝向
+    POST /cancel     /reloc {"mode": "auto"} 或 {"mode": "manual", "x", "y", "yaw"}（重定位进行中、排队中的重复请求一律拒绝）
+    POST /confirm             人核对过自动重定位的结果（自动重定位后必须核对才能选目标；手动点选的不用；
+                              启动时在上次停止的位置附近定位成功的，视为已核对）
+    POST /speed {"v"}         线速度上限（0.1–0.5 m/s）
+    POST /heartbeat           网页每秒调一次；收到过心跳后中断超过 HEARTBEAT_TIMEOUT，正在导航则停车（页面关了、手机息屏）
+上次位姿：定位且已核对时每 3 s 把地图系位姿写进 <地图>/last_pose.json；下次启动先在它附近小范围搜（快、不会认到远处的相似位置），
+对上了就直接可用，对不上再全图搜并要求人核对。
 NAV_DRY_RUN=1：只算不动（不向 7011 发速度）；EXPLORE_V / EXPLORE_W 限速（nav.sh 默认 0.3 m/s）。
 """
+import base64
 import json
 import math
 import os
 import sys
+import zlib
 import threading
 import time
 from collections import deque
@@ -36,6 +44,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
 import numpy as np
 import rospy
 from nav_msgs.msg import Odometry
+from scipy.ndimage import distance_transform_edt
 from sensor_msgs.msg import Imu, PointCloud2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,8 +57,18 @@ PORT = 7014
 LOC_WINDOW = 1.0            # 重定位用最近这么久的点云 (s)
 TRACK_WINDOW = 0.5          # 跟踪用最近这么久的点云 (s)
 TRACK_PERIOD = 1.0          # 跟踪间隔 (s)
-AUTO_RELOC_AFTER = 3.0      # FAST-LIVO2 出位姿这么久后自动重定位一次 (s)
+AUTO_RELOC_AFTER = 1.2      # FAST-LIVO2 出位姿这么久后自动重定位一次 (s)：只要攒够 LOC_WINDOW 的点云
+AUTO_RETRIES = 10           # 启动时点云还不够就隔 0.5 s 再试，最多这么多次
 LOC_VOXEL = 0.08            # 定位用点云先体素降采样 (m)
+LAST_POSE_R, LAST_POSE_YAW = 1.0, math.radians(25)   # 启动定位结果离上次位姿在此之内，视为已核对
+LAST_POSE_PERIOD = 3.0      # 上次位姿的保存间隔 (s)
+GOAL_SNAP_R = 1.0           # 目标不可通行时，在这个半径内找最近的可通行格 (m)
+FINAL_YAW_TOL = math.radians(7)     # 到点后转向指定朝向的容差
+FINAL_TURN_TIMEOUT = 15.0   # 转不到指定朝向（被避障挡住等）这么久就算到达 (s)
+HEARTBEAT_TIMEOUT = 5.0     # 网页心跳中断这么久，正在导航则停车 (s)
+V_RANGE = (0.1, 0.5)        # 网页可调的线速度上限范围 (m/s)；7011 的上限是 0.5
+SCAN_EVERY_SHOW, SCAN_MAX, SCAN_UNIT = 5, 1200, 0.02    # 网页显示的实时障碍点：每 5 帧一次、最多这么多点、2 cm 为单位的 int16
+SCAN_BAND = (0.1, 1.6)      # 显示地面以上这个高度带内的点 (m)
 
 
 class Navigator(explorer.Explorer):
@@ -82,7 +101,21 @@ class Navigator(explorer.Explorer):
         self.auto_tried = False
         self.loc_fail = 0
         self.loc_ms = None
-        self.target = None
+        self.target = None              # [x, y] 或 [x, y, yaw]
+        self.target_yaw = None          # 到点后要转到的朝向（没指定为 None）
+        self.final_turn_t0 = None
+        self.auto_retries = 0
+        self.hb_t = None                # 最近一次网页心跳；None = 没有网页在发（命令行 / 仿真），不检查
+        self.scan_b64 = ""              # 网页显示的实时障碍点（地图系，int16 小端，SCAN_UNIT 为单位）
+        self.grid_v, self._grid_crc = 0, None       # 栅格图版本：变了网页才重新取图
+        self.last_pose_file = os.path.join(nav_dir, "last_pose.json")
+        self.last_pose = None           # 上次运行最后的地图系位姿 [x, y, yaw]
+        try:
+            with open(self.last_pose_file) as f:
+                lp = json.load(f)
+            self.last_pose = [float(lp["x"]), float(lp["y"]), float(lp["yaw"])]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 
     # ------------------------------------------------------------ 输入
     def on_odom(self, msg):
@@ -120,11 +153,22 @@ class Navigator(explorer.Explorer):
         xyz = np.stack([a["x"], a["y"], a["z"]], axis=1).astype(np.float64)
         xyz = xyz[np.einsum("ij,ij->i", xyz, xyz) > 0.04]
         base = xyz @ self.T_b_l[:3, :3].T + self.T_b_l[:3, 3]
-        xyz = xyz[~self.safety.is_self(base[:, :2])]
+        keep = ~self.safety.is_self(base[:, :2])
+        xyz, base = xyz[keep], base[keep]
         ts = msg.header.stamp.to_sec()
         with self.lock:
             self.loc_frames.append((ts, nl.voxel(xyz, LOC_VOXEL)))
+            pose = self.pose
         self.scan_n += 1
+        if self.scan_n % SCAN_EVERY_SHOW == 0 and pose is not None:
+            # 底盘系（原点在地面）高度带内的点按当前位姿放到地图上，给网页看"机器人现在看到的障碍"
+            b = base[(base[:, 2] > SCAN_BAND[0]) & (base[:, 2] < SCAN_BAND[1])]
+            if len(b) > SCAN_MAX:
+                b = b[:: len(b) // SCAN_MAX + 1]
+            c, s_ = math.cos(pose[2]), math.sin(pose[2])
+            mx, my = pose[0] + c * b[:, 0] - s_ * b[:, 1], pose[1] + s_ * b[:, 0] + c * b[:, 1]
+            q = np.clip(np.round(np.column_stack([mx, my]) / SCAN_UNIT), -32000, 32000).astype("<i2")
+            self.scan_b64 = base64.b64encode(q.tobytes()).decode()
         if self.scan_n % explorer.SCAN_EVERY == 0 and self.T_mo is not None:
             with self.integ_lock:
                 self.cloud_q.append((ts, xyz[::3]))
@@ -171,7 +215,7 @@ class Navigator(explorer.Explorer):
                     req, self.loc_req = self.loc_req, None
                     first = self.first_odom_t
                 if req is None and not self.auto_tried and first and time.time() - first > AUTO_RELOC_AFTER:
-                    req, self.auto_tried = {"mode": "auto"}, True
+                    req, self.auto_tried = {"mode": "auto", "startup": True}, True
                 if req is not None:
                     self.relocalize(req)
                 elif self.T_mo is not None and time.time() - last_track > TRACK_PERIOD:
@@ -182,16 +226,38 @@ class Navigator(explorer.Explorer):
 
     def relocalize(self, req):
         manual = req.get("mode") == "manual"
+        startup = bool(req.get("startup"))
         if self.enabled:
             self.disable("重新定位，已停止导航")
         self.set_loc(state="relocalizing", msg="手动重定位中…" if manual else "自动重定位中…")
         lev, T_ol = self.level_scan(LOC_WINDOW)
         if lev is None:
-            self.set_loc(state="unlocalized", msg="雷达或 FAST-LIVO2 数据不足，稍后重试")
+            if startup and self.auto_retries < AUTO_RETRIES:
+                # 刚启动、点云还没攒够：过 0.5 s 再试，不用人去点
+                self.auto_retries += 1
+                with self.lock:
+                    self.first_odom_t = time.time() - AUTO_RELOC_AFTER + 0.5
+                    self.auto_tried = False
+                self.set_loc(state="unlocalized", msg="等待雷达与 FAST-LIVO2 数据…")
+                return
+            self.set_loc(state="localized" if self.T_mo is not None else "unlocalized",
+                         msg="雷达或 FAST-LIVO2 数据不足，稍后重试")
             return
-        hint = (float(req["x"]), float(req["y"]), float(req["yaw"])) if manual else None
         t0 = time.time()
-        r = nl.relocalize(self.nav, lev, hint)
+        r, trusted = None, False
+        if startup and self.last_pose is not None:
+            # 先在上次停止的位置附近小范围搜：机器人多半没被挪过，这样快，也不会认到远处的相似位置
+            lp = self.last_pose
+            r1 = nl.relocalize(self.nav, lev, tuple(lp))
+            if r1["ok"] and r1["fitness"] >= nl.FIT_ACCEPT_AUTO:
+                T = r1["T"]
+                d = math.hypot(T[0, 3] - lp[0], T[1, 3] - lp[1])
+                dy = abs(math.remainder(math.atan2(T[1, 0], T[0, 0]) - lp[2], 2 * math.pi))
+                if d <= LAST_POSE_R and dy <= LAST_POSE_YAW:
+                    r, trusted = r1, True
+        if r is None:
+            hint = (float(req["x"]), float(req["y"]), float(req["yaw"])) if manual else None
+            r = nl.relocalize(self.nav, lev, hint)
         info = {k: round(r[k], 3) for k in ("fitness", "rmse") if k in r}
         info["time_s"] = round(time.time() - t0, 1)
         if not r["ok"]:
@@ -200,14 +266,16 @@ class Navigator(explorer.Explorer):
                          msg=r["msg"] + ("（保留原定位）" if self.T_mo is not None else ""), **info,
                          candidates=r.get("candidates", [])[:5])
             return
+        ok_now = manual or trusted
         with self.lock:
             self.T_mo = r["T"] @ np.linalg.inv(T_ol)
             self.loc_fail = 0
-            self.confirmed = manual
-            self.state, self.msg = "idle", ("已定位，可在地图上点选目标" if manual
+            self.confirmed = ok_now
+            self.state, self.msg = "idle", ("已定位，可在地图上选目标" if ok_now
                                             else "已自动定位，请核对地图上机器人的位置与朝向")
         Tm = r["T"]
-        self.set_loc(state="localized", msg="定位成功" if manual else "自动定位成功，请核对", **info,
+        self.set_loc(state="localized", **info,
+                     msg="定位成功" if manual else "与上次停止时的位置一致，已自动确认" if trusted else "自动定位成功，请核对",
                      pose=[round(Tm[0, 3], 2), round(Tm[1, 3], 2), round(math.atan2(Tm[1, 0], Tm[0, 0]), 3)])
 
     def track(self):
@@ -239,7 +307,29 @@ class Navigator(explorer.Explorer):
                          fitness=round(r["fitness"], 3), rmse=round(r["rmse"], 3))
 
     # ------------------------------------------------------------ 目标（网页调用）
-    def goto(self, x, y):
+    def snap_goal(self, st, xy, local, to_world):
+        """目标格不可通行（障碍、未知、离障碍不到膨胀半径）时，GOAL_SNAP_R 内的可通行格由近到远排好返回（世界坐标）。"""
+        clear = distance_transform_edt(st != eg.OCC) * eg.RES
+        passable = (st == eg.FREE) & (clear > eg.INFLATE + 0.05)
+        ci, cj = local(xy)
+        k = int(GOAL_SNAP_R / eg.RES)
+        h, w = st.shape
+        a0, b0 = max(0, ci - k), max(0, cj - k)
+        win = passable[a0:max(0, ci + k + 1), b0:max(0, cj + k + 1)]
+        ij = np.argwhere(win) + (a0, b0)
+        if not len(ij) or not (-k <= ci < h + k and -k <= cj < w + k):
+            return []
+        d = np.hypot(ij[:, 0] - ci, ij[:, 1] - cj)
+        order = np.argsort(d)
+        order = order[d[order] <= k]
+        # 最近的一个，以及最近的"能转身"的一个（离障碍 TURN_CLEAR 以上），各试一次
+        out = [ij[order[0]]] if len(order) else []
+        roomy = [o for o in order if clear[ij[o][0], ij[o][1]] >= eg.TURN_CLEAR]
+        if roomy and not (ij[roomy[0]] == out[0]).all():
+            out.append(ij[roomy[0]])
+        return [to_world(c) for c in out]
+
+    def goto(self, x, y, yaw=None):
         with self.lock:
             if self.T_mo is None or self.loc.get("state") != "localized":
                 return False, "还没定位，先定位再选目标"
@@ -250,28 +340,60 @@ class Navigator(explorer.Explorer):
         if pose is None:
             return False, "还没有地图系位姿"
         st, (i0, j0) = grid.state()
-        local = lambda xy: tuple(grid.cell(xy) - (i0, j0))
-        res = eg.plan(st, local(pose[:2]), home=local((x, y)))
+        local = lambda xy: tuple(int(v) for v in grid.cell(xy) - (i0, j0))
+        to_world = lambda ij: tuple(np.round(grid.center(np.asarray(ij) + (i0, j0)), 3).tolist())
+        start = local(pose[:2])
+        res = eg.plan(st, start, home=local((x, y)))
+        note = ""
+        if "path" not in res and res.get("reason") != "起点不在可通行区域":
+            for alt in self.snap_goal(st, (x, y), local, to_world):
+                r2 = eg.plan(st, start, home=local(alt))
+                if "path" in r2:
+                    note = f"（目标离障碍太近，已挪 {math.hypot(alt[0] - x, alt[1] - y):.2f} m 到最近的可通行处）"
+                    res, (x, y) = r2, alt
+                    break
         if "path" not in res:
-            return False, f"去不了这里：{res.get('reason')}（目标要在白色的可通行区域、离障碍 0.4 m 以上）"
+            return False, f"去不了这里：{res.get('reason')}（附近 {GOAL_SNAP_R:.0f} m 内没有能到的白色可通行区域）"
+        corners = [to_world(c) for c in res["path"]]
         with self.lock:
             self.home = (float(x), float(y))
-            self.target = self.home
+            self.target = [round(float(x), 3), round(float(y), 3)] + ([round(float(yaw), 3)] if yaw is not None else [])
+            self.target_yaw, self.final_turn_t0 = (float(yaw) if yaw is not None else None), None
             self.going_home, self.enabled, self.stop_at = True, True, None
-            self.goal, self.path, self.corners, self.corner_idx = None, [], [], []
+            # 路线直接用上面规划的，不等规划线程下一轮（最多 1 s）
+            self.goal, self.corners = to_world(res["goal"]), corners
+            self.path, self.corner_idx = explorer.densify(corners) if len(corners) > 1 else ([], [])
             self.blacklist, self.visited = [], []
             self.feedback = {}
             self.t_enter = time.time()
-            self.state, self.msg = "home", f"前往目标，路程约 {res['length']:.1f} m"
-        rospy.loginfo("前往目标 (%.2f, %.2f)，路程约 %.1f m", x, y, res["length"])
+            self.state, self.msg = "home", f"前往目标，路程约 {res['length']:.1f} m{note}"
+        rospy.loginfo("前往目标 (%.2f, %.2f)，路程约 %.1f m%s", x, y, res["length"], note)
         return True, self.msg
+
+    def follow(self, pose):
+        """到点后若指定了车头朝向，先原地转过去再算到达。"""
+        cmd = super().follow(pose)
+        if cmd is not None or self.target_yaw is None:
+            return cmd
+        err = explorer.wrap(self.target_yaw - pose[2])
+        if abs(err) <= FINAL_YAW_TOL:
+            return None
+        now = time.time()
+        if self.final_turn_t0 is None:
+            self.final_turn_t0 = now
+        if now - self.final_turn_t0 > FINAL_TURN_TIMEOUT:
+            rospy.logwarn("到点后 %.0f s 内没能转到指定朝向（还差 %.0f°），按到达处理", FINAL_TURN_TIMEOUT, math.degrees(err))
+            return None
+        self.msg = f"已到目标点，转向指定朝向（还差 {abs(math.degrees(err)):.0f}°）"
+        return 0.0, 0.0, math.copysign(min(explorer.W_MAX, max(explorer.MIN_TURN_W, 1.5 * abs(err))), err)
 
     def confirm(self):
         with self.lock:
             if self.T_mo is None or self.loc.get("state") != "localized":
                 return False, "还没定位"
             self.confirmed = True
-            self.msg = "定位已确认，可在地图上点选目标"
+            self.loc["msg"] = "定位已确认"
+            self.msg = "定位已确认，可在地图上选目标"
         return True, self.msg
 
     def cancel(self):
@@ -282,37 +404,93 @@ class Navigator(explorer.Explorer):
         if body.get("mode") == "manual" and not all(k in body for k in ("x", "y", "yaw")):
             return False, "手动定位需要 x、y、yaw"
         with self.lock:
-            if self.loc.get("state") == "relocalizing":
+            if self.loc.get("state") == "relocalizing" or self.loc_req is not None:
                 return False, "正在重定位，请稍候"
-            self.loc_req = body
+            if not self.auto_tried:
+                if body.get("mode") != "manual":
+                    return False, "启动后的自动重定位马上开始，请稍候"
+                self.auto_tried = True      # 人已经手动点选了，不再自动来一遍
+            self.loc_req = dict(body, startup=False)
         return True, "开始重定位"
+
+    def set_speed(self, v):
+        v = max(V_RANGE[0], min(V_RANGE[1], float(v)))
+        explorer.V_MAX = v
+        explorer.LOOKAHEAD = max(0.9, 3.0 * v)
+        return True, f"限速 {v:.2f} m/s"
+
+    def heartbeat(self):
+        self.hb_t = time.time()
+        return True, ""
+
+    def watch_loop(self):
+        """心跳中断 / 急停时取消导航；定期保存上次位姿。"""
+        last_save = 0.0
+        while not rospy.is_shutdown():
+            time.sleep(0.5)
+            try:
+                now = time.time()
+                if self.enabled and self.hb_t is not None and now - self.hb_t > HEARTBEAT_TIMEOUT:
+                    self.disable(f"网页心跳中断 {HEARTBEAT_TIMEOUT:.0f} s（页面关闭或手机息屏），已停车并取消本次导航")
+                if self.enabled and self.feedback.get("estop"):
+                    self.disable("急停，已取消本次导航；解除急停后请重新选目标")
+                if now - last_save > LAST_POSE_PERIOD:
+                    last_save = now
+                    self.save_last_pose()
+            except Exception as e:      # noqa: BLE001
+                rospy.logerr("监控线程异常：%s", e)
+
+    def save_last_pose(self):
+        with self.lock:
+            ok = self.confirmed and self.loc.get("state") == "localized" and self.pose is not None
+            pose = self.pose
+        if not ok:
+            return
+        tmp = self.last_pose_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"x": round(pose[0], 3), "y": round(pose[1], 3), "yaw": round(pose[2], 4),
+                       "t": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        os.replace(tmp, self.last_pose_file)
 
     def finish(self):
         """到达目标（Explorer.run 在 going_home 到达时调用）。"""
         with self.lock:
             self.enabled, self.going_home = False, False
             self.goal, self.path, self.corners = None, [], []
+            self.target_yaw, self.final_turn_t0 = None, None
             self.state, self.msg = "arrived", "已到达目标"
         rospy.loginfo("已到达目标")
 
     def replan(self):
-        if self.pose is None:          # 未定位：只更新栅格图
-            st, _ = self.grid.state()
+        with self.lock:
+            grid = self.grid
+            busy = self.pose is not None and self.enabled
+        if busy:
+            super().replan()
+        elif grid is not None:
+            # 没在导航（未定位、待命）：只更新栅格图，不做规划（Explorer.replan 每秒一次全图最短路 + 找边界，白占一个核）
+            st, (i0, j0) = grid.state()
             if st is not None:
                 self.grid_png = eg.render(st)
-                i0, _, j0, _ = self.grid.bbox
-                self.grid_meta = {"x0": (max(0, i0 - 2) - self.grid.n / 2) * eg.RES,
-                                  "y0": (max(0, j0 - 2) - self.grid.n / 2) * eg.RES,
+                self.grid_meta = {"x0": (i0 - grid.n / 2) * eg.RES, "y0": (j0 - grid.n / 2) * eg.RES,
                                   "w": st.shape[0] * eg.RES, "h": st.shape[1] * eg.RES}
-            return
-        super().replan()
+        crc = zlib.crc32(self.grid_png) if self.grid_png else None
+        if crc != self._grid_crc:
+            self._grid_crc, self.grid_v = crc, self.grid_v + 1
 
     def snapshot(self, full=False):
         s = super().snapshot(full)
+        for k in ("frontiers", "strategies", "strategy", "blacklist", "visited", "region", "region_switches",
+                  "goals_done", "stop_in", "home", "time_limit_min"):     # 自主建图的东西，导航用不着
+            s.pop(k, None)
         with self.lock:
             s.update(loc=dict(self.loc), target=self.target, map=self.meta, loc_ms=self.loc_ms, confirmed=self.confirmed,
-                     odom_pose=self.odom_pose and [round(v, 3) for v in self.odom_pose])
-        s["dry_run"] = explorer.DRY_RUN
+                     odom_pose=self.odom_pose and [round(v, 3) for v in self.odom_pose],
+                     reloc_pending=self.loc_req is not None or not self.auto_tried,
+                     last_pose=self.last_pose)
+        s.update(dry_run=explorer.DRY_RUN, scan=self.scan_b64, scan_unit=SCAN_UNIT, grid_v=self.grid_v,
+                 v_range=list(V_RANGE), robot_r=eg.ROBOT_R,
+                 heartbeat=self.hb_t is not None and time.time() - self.hb_t < HEARTBEAT_TIMEOUT)
         return s
 
 
@@ -331,6 +509,19 @@ def serve(nv):
         def do_GET(self):
             if self.path.startswith("/state"):
                 self.reply(nv.snapshot())
+            elif self.path.startswith("/stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    while not rospy.is_shutdown():
+                        data = json.dumps(nv.snapshot(), ensure_ascii=False, separators=(",", ":"))
+                        self.wfile.write(f"event: state\ndata: {data}\n\n".encode())
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                except OSError:
+                    pass
             elif self.path.startswith("/grid.png") and nv.grid_png:
                 self.reply(nv.grid_png, "image/png")
             else:
@@ -346,7 +537,12 @@ def serve(nv):
                 body = {}
             try:
                 if self.path == "/goto":
-                    ok, msg = nv.goto(float(body["x"]), float(body["y"]))
+                    yaw = body.get("yaw")
+                    ok, msg = nv.goto(float(body["x"]), float(body["y"]), None if yaw is None else float(yaw))
+                elif self.path == "/speed":
+                    ok, msg = nv.set_speed(body["v"])
+                elif self.path == "/heartbeat":
+                    ok, msg = nv.heartbeat()
                 elif self.path == "/cancel":
                     ok, msg = nv.cancel()
                 elif self.path == "/confirm":
@@ -377,6 +573,7 @@ def main():
     serve(nv)
     threading.Thread(target=nv.plan_loop, daemon=True).start()
     threading.Thread(target=nv.loc_loop, daemon=True).start()
+    threading.Thread(target=nv.watch_loop, daemon=True).start()
     rospy.loginfo("navigator 启动：地图 %s（%s），限速 %.2f m/s%s", nv.meta.get("name"), nav_dir, explorer.V_MAX,
                   "（只算不动）" if explorer.DRY_RUN else "")
     try:
@@ -384,6 +581,7 @@ def main():
     finally:
         if nv.enabled:
             nv.send(0, 0, 0)
+        nv.save_last_pose()
 
 
 if __name__ == "__main__":

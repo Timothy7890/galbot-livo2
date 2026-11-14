@@ -13,22 +13,27 @@
     POST /api/estop/release  解除急停（同样转发给 7011）
 
 导航（成熟地图，见 ../nav.sh、scripts/nav_map.py、scripts/navigator.py；页面 /nav.html）：
-    GET  /api/nav             导航运行状态 + 可用地图（有 nav/ 的录制）+ 运行中时 navigator 的状态
+    GET  /api/nav             导航运行状态（启动中带 step 进度）+ 可用地图（有 nav/ 的录制）+ 最近一次启动失败
+    GET  /api/nav/stream      运行中 navigator 的实时状态 SSE（每 0.2 s，转发 7014 /stream）
     GET  /api/nav/grid.png    运行中：实时栅格；否则 ?session=<录制> 取该录制的地图图片
+    GET  /api/nav/traj?session=<录制>   建图轨迹 [[x, y], ...]
     POST /api/nav/build       {"session", "name"} 由录制生成导航地图（后台，进度在录制列表的 nav_progress）
-    POST /api/nav/start       {"session"} 启动导航；/api/nav/stop 停止
-    POST /api/nav/goto {"x","y"} | cancel | reloc {"mode", "x","y","yaw"} | confirm   转发给 navigator（7014）
+    POST /api/nav/start       {"session", "vision", "dry_run"} 启动导航（后台，立即返回，进度看 /api/nav）；/api/nav/stop 停止（后台）
+    POST /api/nav/goto {"x","y"[,"yaw"]} | cancel | reloc {"mode", "x","y","yaw"} | confirm | speed {"v"} | heartbeat
+                              转发给 navigator（7014）
+状态里的 stale：本服务启动后 server.py / webcommon.py 又被更新而没重启，页面据此提示。
 """
 import json
 import os
 import re
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from webcommon import DATA_ROOT, PROJECT_DIR, BaseHandler, LastError, last_line, parse_kv, run_script
+from webcommon import DATA_ROOT, PROJECT_DIR, BaseHandler, CodeWatch, LastError, last_line, parse_kv, run_script
 
 PORT = int(os.environ.get("RECORD_WEB_PORT", "7010"))
 RECORD_SH = PROJECT_DIR / "record.sh"
@@ -52,6 +57,7 @@ def main_camera():
 
 busy = threading.Lock()   # 同一时间只允许一个 start/stop
 last_error = LastError()
+code_watch = CodeWatch(__file__, PROJECT_DIR / "web/webcommon.py")
 
 
 def list_sessions(limit=30):
@@ -128,22 +134,74 @@ def nav_status():
     return parse_kv(out)
 
 
+_maps_cache = {"t": 0.0, "maps": []}
+
+
+def nav_maps():
+    """可用的导航地图。每张要读 meta.json，导航页 0.5–2 s 轮询一次，缓存 3 s。"""
+    if time.time() - _maps_cache["t"] > 3:
+        _maps_cache.update(t=time.time(),
+                           maps=[{"session": s["name"], **s["nav"]} for s in list_sessions(100) if s.get("nav")])
+    return _maps_cache["maps"]
+
+
 def nav_payload():
     st = nav_status()
-    out = {"status": st.get("status", "idle"), "map": st.get("map"), "error": nav_error.get(),
-           "maps": [{"session": s["name"], **s["nav"]} for s in list_sessions(100) if s.get("nav")],
-           "estop": teleop_estop()}
-    if out["status"] != "idle":
-        try:
-            with urllib.request.urlopen(NAV_URL + "state", timeout=2) as r:
-                out["state"] = json.loads(r.read())
-        except (OSError, ValueError):
-            out["state"] = None
+    status = st.get("status", "idle")
+    if nav_busy.locked() and status == "idle":
+        status = nav_op["op"] or "starting"         # 脚本刚起、还没写状态文件
+    out = {"status": status, "map": st.get("map"), "error": nav_error.get(), "maps": nav_maps(),
+           "vision": st.get("vision") != "false", "dry_run": st.get("dry_run") == "true",
+           "elapsed_s": st.get("elapsed_s"), "step": st.get("step"), "step_elapsed_s": st.get("step_elapsed_s"),
+           "start_fail": nav_op["fail"], "estop": teleop_estop(), "stale": code_watch.stale(),
+           "recording": recording_now()}
+    if nav_busy.locked() and nav_op["op"] == "stopping":
+        out["status"] = "stopping"
     return out
+
+
+def recording_now():
+    """是否在录制（含启动中、停止中）。直接看 record.sh 的状态文件，不为这一个标志再跑一次脚本。"""
+    try:
+        return parse_kv((PROJECT_DIR / "run/state").read_text()).get("status", "idle") != "idle"
+    except OSError:
+        return False
+
+
+def nav_traj(name, max_pts=800):
+    import numpy as np
+    t = np.load(DATA_ROOT / name / "nav" / "traj.npz")["traj"]
+    step = max(1, len(t) // max_pts)
+    return np.round(t[::step, 1:3], 3).tolist()
 
 
 nav_busy = threading.Lock()
 nav_error = LastError()
+nav_op = {"op": "", "fail": None}       # 进行中的操作（starting / stopping）；最近一次启动失败 {msg, step}，下次启动时清掉
+
+
+def nav_run(op, *args):
+    """后台执行 nav.sh start / stop（调用方已拿到 nav_busy）。"""
+    try:
+        last_step = {"step": ""}
+        if op == "starting":
+            # 启动中记下走到哪一步：失败后状态文件就没了，页面要标出停在哪
+            def watch():
+                while nav_busy.locked():
+                    last_step["step"] = nav_status().get("step") or last_step["step"]
+                    time.sleep(0.5)
+            threading.Thread(target=watch, daemon=True).start()
+        try:
+            code, out = run_script(NAV_SH, *args, timeout=150)
+        except subprocess.TimeoutExpired:
+            code, out = 1, "操作超时（150 s）"
+        nav_error.set("" if code == 0 else last_line(out, "操作失败"))
+        if op == "starting" and code != 0:
+            line = next((l for l in reversed(out.splitlines()) if "启动失败" in l), last_line(out, "启动失败"))
+            nav_op["fail"] = {"msg": re.sub(r"^\[[\d:]+\]\s*(启动失败[:：]\s*)?", "", line), "step": last_step["step"]}
+    finally:
+        nav_op["op"] = ""
+        nav_busy.release()
 
 
 def status_payload():
@@ -157,6 +215,7 @@ def status_payload():
     st["sessions"] = list_sessions()
     st["estop"] = teleop_estop()
     st["nav"] = nav_status().get("status", "idle")
+    st["stale"] = code_watch.stale()
     return st
 
 
@@ -201,6 +260,17 @@ class Handler(BaseHandler):
                 self.send(503, {"error": "未在录制"})
         elif path == "/api/nav":
             self.send(200, nav_payload())
+        elif path == "/api/nav/stream":
+            self.proxy_sse(NAV_URL + "stream", "导航未运行")
+        elif path == "/api/nav/traj":
+            q = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
+            name = q.get("session", "")
+            if not SESSION_NAME.match(name) or not (DATA_ROOT / name / "nav" / "traj.npz").exists():
+                return self.send(404, {"error": "没有这张地图"})
+            try:
+                self.send(200, nav_traj(name))
+            except Exception as e:      # noqa: BLE001  numpy 没装、文件坏了都只是不显示轨迹
+                self.send(500, {"error": str(e)})
         elif path == "/api/nav/grid.png":
             q = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
             name = q.get("session", "")
@@ -255,33 +325,32 @@ class Handler(BaseHandler):
         elif self.path == "/api/nav/build":
             b = self.body_json()
             ok, msg = build_nav(str(b.get("session", "")), b.get("name"))
+            _maps_cache["t"] = 0.0
             self.send(200 if ok else 409, {"ok": ok, "msg": msg})
         elif self.path in ("/api/nav/start", "/api/nav/stop"):
+            starting = self.path.endswith("start")
+            args = ["stop"]
+            if starting:
+                b = self.body_json()
+                name = str(b.get("session", ""))
+                if not SESSION_NAME.match(name) or not (DATA_ROOT / name / "nav" / "meta.json").exists():
+                    return self.send(404, {"ok": False, "msg": "没有这张导航地图"})
+                args = ["start", str(DATA_ROOT / name / "nav")]
+                if b.get("vision") is False:
+                    args.append("--no-vision")
+                if b.get("dry_run"):
+                    args.append("--dry-run")
             if not nav_busy.acquire(blocking=False):
                 return self.send(409, {"ok": False, "msg": "正在启动或停止导航"})
-            try:
-                if self.path.endswith("start"):
-                    name = str(self.body_json().get("session", ""))
-                    if not SESSION_NAME.match(name) or not (DATA_ROOT / name / "nav" / "meta.json").exists():
-                        return self.send(404, {"ok": False, "msg": "没有这张导航地图"})
-                    code, out = run_script(NAV_SH, "start", str(DATA_ROOT / name / "nav"), timeout=150)
-                else:
-                    code, out = run_script(NAV_SH, "stop", timeout=60)
-            finally:
-                nav_busy.release()
-            nav_error.set("" if code == 0 else last_line(out, "操作失败"))
-            self.send(200 if code == 0 else 500, {"ok": code == 0, "msg": out})
-        elif self.path in ("/api/nav/goto", "/api/nav/cancel", "/api/nav/reloc", "/api/nav/confirm"):
-            req = urllib.request.Request(NAV_URL + self.path.rsplit("/", 1)[1],
-                                         data=json.dumps(self.body_json()).encode(), method="POST",
-                                         headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    self.send(r.status, r.read())
-            except urllib.error.HTTPError as e:
-                self.send(e.code, e.read())
-            except OSError:
-                self.send(503, {"ok": False, "msg": "导航未运行"})
+            nav_op["op"] = "starting" if starting else "stopping"
+            if starting:
+                nav_op["fail"] = None
+            nav_error.set("")
+            threading.Thread(target=nav_run, args=(nav_op["op"], *args), daemon=True).start()
+            self.send(202, {"ok": True, "msg": "正在启动导航" if starting else "正在停止导航"})
+        elif self.path in ("/api/nav/goto", "/api/nav/cancel", "/api/nav/reloc", "/api/nav/confirm",
+                           "/api/nav/speed", "/api/nav/heartbeat"):
+            self.proxy_post(NAV_URL + self.path.rsplit("/", 1)[1], self.body_json(), "导航未运行")
         elif self.path == "/api/stop":
             if busy.locked():
                 return self.send(409, {"ok": False, "msg": "正在执行其他操作"})

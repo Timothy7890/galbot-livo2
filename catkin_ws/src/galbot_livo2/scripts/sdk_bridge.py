@@ -42,16 +42,32 @@ def stamp(ns):
 
 class Bridge:
     def __init__(self):
-        self.main_cam = rospy.get_param("galbot/main_camera", "left_front")
+        # ~main_camera：nav.sh 与读标定同时启动本节点，那时参数服务器上还没有 galbot/main_camera
+        self.main_cam = rospy.get_param("~main_camera", "") or rospy.get_param("galbot/main_camera", "left_front")
         self.all_cams = rospy.get_param("~publish_all_cameras", True)
         self.head_cams = rospy.get_param("~publish_head_cameras", True)
-        surround = list(CAMERAS) if self.all_cams else [self.main_cam]
+        # ~publish_main_camera:=false：导航不开视觉时一路相机都不取（FAST-LIVO2 只用雷达 + IMU）
+        main_on = rospy.get_param("~publish_main_camera", True)
+        surround = list(CAMERAS) if self.all_cams else ([self.main_cam] if main_on else [])
         self.groups = {"surround": {name: CAMERAS[name] for name in surround}}
         if self.head_cams:
             self.groups["head"] = dict(HEAD_CAMERAS)
         sensors = [s for g in self.groups.values() for s in g.values()]
 
         self.robot = open_robot({LIDAR, IMU, *sensors})
+        # ~calib_out:=目录：顺手把标定（g1_calib.yaml / camera_g1.yaml）写到那里，成功后建 .calib_ok、失败建 .calib_fail。
+        # nav.sh 开视觉时用它，不必另起 gen_config.py 再初始化一遍 SDK（两个进程同时初始化反而互相拖慢）
+        out = rospy.get_param("~calib_out", "")
+        if out:
+            try:
+                import gen_config
+                g = gen_config.generate(self.robot, self.main_cam, out, with_all=False)
+                rospy.loginfo("标定已写入 %s，主相机离地（底盘系 z）%.3f m", out, g["T_b_c"][2, 3])
+                open(os.path.join(out, ".calib_ok"), "w").close()
+            except Exception as e:      # noqa: BLE001  SDK 抛出的异常类型不固定
+                rospy.logerr("生成标定失败：%s", e)
+                with open(os.path.join(out, ".calib_fail"), "w") as f:
+                    f.write(str(e))
         self.pub_lidar = rospy.Publisher("/livox/lidar", PointCloud2, queue_size=10)
         self.pub_imu = rospy.Publisher("/livox/imu", Imu, queue_size=400)
         self.pub_img = rospy.Publisher("/galbot/camera/image", Image, queue_size=5)
@@ -184,9 +200,10 @@ class Bridge:
     def run(self):
         threads = [threading.Thread(target=self.imu_loop, daemon=True),
                    threading.Thread(target=self.lidar_loop, daemon=True),
-                   threading.Thread(target=self.camera_loop, args=(self.groups["surround"], FRAME_GAP_NS),
-                                    daemon=True),
                    threading.Thread(target=self.joint_loop, daemon=True)]
+        if self.groups["surround"]:
+            threads.append(threading.Thread(target=self.camera_loop, args=(self.groups["surround"], FRAME_GAP_NS),
+                                            daemon=True))
         if "head" in self.groups:
             threads.append(threading.Thread(target=self.camera_loop, args=(self.groups["head"], HEAD_GAP_NS),
                                             daemon=True))
@@ -194,7 +211,7 @@ class Bridge:
             t.start()
         rospy.Timer(rospy.Duration(10), self.report)
         rospy.loginfo("sdk_bridge 已启动，主相机 %s，相机 %s", self.main_cam,
-                      " ".join(n for g in self.groups.values() for n in g))
+                      " ".join(n for g in self.groups.values() for n in g) or "不开")
         # SDK 在 C++ 层接管了 SIGINT/SIGTERM，rospy 收不到，只能看 SDK 的运行状态来退出
         while not rospy.is_shutdown() and self.robot.is_running():
             time.sleep(0.2)

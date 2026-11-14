@@ -4,6 +4,7 @@ import mimetypes
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -44,6 +45,24 @@ def parse_kv(text):
     return out
 
 
+class CodeWatch:
+    """服务进程启动后源码又被更新（git pull / 部署）而没重启时，页面是新的、接口还是旧的，表现为各种莫名其妙的失败。
+    记下启动时这些文件的修改时间，之后变了就在状态里带上 stale，页面提示重启 web/web.sh restart。"""
+
+    def __init__(self, *files):
+        self.files = {Path(f): self._mtime(Path(f)) for f in files}
+
+    @staticmethod
+    def _mtime(f):
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return None
+
+    def stale(self):
+        return [f.name for f, t in self.files.items() if self._mtime(f) != t]
+
+
 class BaseHandler(BaseHTTPRequestHandler):
     index_page = "index.html"
 
@@ -71,6 +90,8 @@ class BaseHandler(BaseHTTPRequestHandler):
         self.send(200, f.read_bytes(), ctype)
 
     def static(self, path):
+        if path.startswith("/api/"):        # 未知接口不能回落到入口页（200 + HTML），调用方会当成功
+            return self.send(404, {"ok": False, "error": "not found", "msg": f"服务端没有接口 {path}（代码更新后没重启？web/web.sh restart）"})
         f = (DIST_DIR / path.lstrip("/")).resolve()
         if path == "/" or not f.is_file():
             f = DIST_DIR / self.index_page    # 单页应用：未知路径都返回入口页
@@ -102,7 +123,19 @@ class BaseHandler(BaseHTTPRequestHandler):
         finally:
             upstream.close()
 
+    def proxy_post(self, url, body, unavailable_msg):
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.send(r.status, r.read())
+        except urllib.error.HTTPError as e:
+            self.send(e.code, e.read())
+        except OSError:
+            self.send(503, {"ok": False, "msg": unavailable_msg})
+
     def log_message(self, fmt, *args):
+        # 只记操作（POST）与少数 GET；轮询、心跳、取图不记，否则日志一天几十万行
         line = str(args[0] if args else "")
-        if "/api/" in line and not any(s in line for s in ("/status", "/camera/")):
+        if "/api/" in line and line.startswith("POST") and "/heartbeat" not in line:
             super().log_message(fmt, *args)

@@ -1,15 +1,15 @@
 <script setup>
-// 导航地图：成熟地图的 2D 栅格（运行中为实时更新的栅格）+ 机器人、目标、路线；
-// mode = 'goal'：点一下选目标；mode = 'reloc'：按下定位置、拖动定车头朝向；其余时候拖动平移、滚轮 / 双指缩放
+// 导航地图：成熟地图的 2D 栅格（运行中为实时更新的栅格）+ 建图轨迹 + 实时障碍点 + 机器人（车身圆 + 车头箭头）+ 目标与路线。
+// mode = 'goal'：点一下选目标；按住拖动再松开 = 同时指定到点后的车头朝向
+// mode = 'reloc'：在机器人实际位置按下，朝车头方向拖动后松开
+// 其余时候单指拖动平移；任何时候滚轮 / 双指都可缩放和平移
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 
 const props = defineProps({
   gridUrl: { type: String, default: '' },     // 栅格图片地址（变化即重新加载）
   grid: { type: Object, default: null },      // { x0, y0, w, h } 世界范围
-  pose: { type: Array, default: null },       // [x, y, yaw]
-  target: { type: Array, default: null },
-  path: { type: Array, default: null },
-  candidates: { type: Array, default: null }, // 重定位候选 [{x, y, yaw}]
+  state: { type: Object, default: null },     // navigator 推送的状态（pose / path / target / scan / loc ...）
+  traj: { type: Array, default: () => [] },   // 建图轨迹 [[x, y], ...]
   mode: { type: String, default: '' },
 })
 const emit = defineEmits(['pick'])
@@ -23,7 +23,9 @@ let needDraw = true
 let raf = 0
 let img = null
 let fitted = false
-let drag = null       // reloc 模式下按下的位置与当前指针（世界坐标）
+let userMoved = false   // 人拖过 / 缩放过视图之后，窗口大小变化不再自动回到全图
+let drag = null       // 点选中：{ x, y, sx, sy, yaw（拖出方向后才有） }
+const DRAG_PX = 10    // 拖过这么多像素才算在指定朝向
 
 watch(() => props.gridUrl, url => {
   if (!url) { img = null; needDraw = true; return }
@@ -31,24 +33,47 @@ watch(() => props.gridUrl, url => {
   im.onload = () => { img = im; needDraw = true; if (!fitted) fitAll() }
   im.src = url
 }, { immediate: true })
-watch(() => [props.grid, props.pose, props.target, props.path, props.candidates, props.mode, follow.value], () => (needDraw = true))
+watch(() => [props.grid, props.state, props.traj, props.mode, follow.value], () => (needDraw = true))
+watch(follow, v => { if (v) userMoved = true })
+watch(() => props.mode, () => { drag = null })
 
 function w2s(x, y) { return [W / 2 + (x - view.vx) * view.scale, H / 2 - (y - view.vy) * view.scale] }
 function s2w(sx, sy) { return [view.vx + (sx - W / 2) / view.scale, view.vy - (sy - H / 2) / view.scale] }
 
-function arrow(ctx, x, y, yaw, color, size = 1) {
+let scanSrc = '', scanPts = new Int16Array(0)
+function decodeScan(b64) {
+  if (b64 === scanSrc) return scanPts
+  scanSrc = b64
+  if (!b64) return (scanPts = new Int16Array(0))
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return (scanPts = new Int16Array(bytes.buffer))
+}
+
+function arrow(ctx, x, y, yaw, fill, size = 1, stroke = '#000') {
   const [sx, sy] = w2s(x, y)
   ctx.save()
   ctx.translate(sx, sy)
   ctx.rotate(-yaw)
   ctx.scale(size, size)
-  ctx.fillStyle = color
-  ctx.strokeStyle = '#000'
-  ctx.lineWidth = 1.5
+  ctx.fillStyle = fill
+  ctx.strokeStyle = stroke
+  ctx.lineWidth = 1.5 / size
   ctx.beginPath()
   ctx.moveTo(14, 0); ctx.lineTo(-9, 8); ctx.lineTo(-4, 0); ctx.lineTo(-9, -8); ctx.closePath()
   ctx.fill(); ctx.stroke()
   ctx.restore()
+}
+
+function polyline(ctx, pts, color, width, dash = []) {
+  if (!pts || pts.length < 2) return
+  ctx.strokeStyle = color; ctx.lineWidth = width
+  ctx.setLineDash(dash)
+  ctx.beginPath()
+  pts.forEach(([x, y], i) => { const [sx, sy] = w2s(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy) })
+  ctx.stroke()
+  ctx.setLineDash([])
 }
 
 function niceStep(px) {
@@ -62,30 +87,58 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.fillStyle = '#0e1013'
   ctx.fillRect(0, 0, W, H)
-  if (follow.value && props.pose) { view.vx = props.pose[0]; view.vy = props.pose[1] }
+  const st = props.state || {}
+  const pose = st.pose
+  if (follow.value && pose) { view.vx = pose[0]; view.vy = pose[1] }
   const g = props.grid
   if (img && g) {
     ctx.imageSmoothingEnabled = false
     const [gx, gy] = w2s(g.x0, g.y0 + g.h)
     ctx.drawImage(img, gx, gy, g.w * view.scale, g.h * view.scale)
   }
-  for (const c of props.candidates || []) arrow(ctx, c.x, c.y, c.yaw, 'rgba(250,204,21,0.6)', 0.8)
-  if (props.path?.length > 1) {
-    ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
-    ctx.beginPath()
-    props.path.forEach(([x, y], i) => { const [sx, sy] = w2s(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy) })
-    ctx.stroke()
+  polyline(ctx, props.traj, 'rgba(147,170,255,0.55)', 2, [6, 5])
+
+  // 实时障碍点：机器人此刻看到的东西。和红色栅格对得上 = 定位是对的
+  const scan = decodeScan(st.scan || '')
+  if (scan.length) {
+    const u = st.scan_unit || 0.02
+    const sz = Math.max(2, Math.min(4, view.scale * 0.05))
+    ctx.fillStyle = '#22d3ee'
+    for (let i = 0; i < scan.length; i += 2) {
+      const [sx, sy] = w2s(scan[i] * u, scan[i + 1] * u)
+      ctx.fillRect(sx - sz / 2, sy - sz / 2, sz, sz)
+    }
   }
-  if (props.target) {
-    const [sx, sy] = w2s(props.target[0], props.target[1])
-    ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
-    ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI * 2); ctx.stroke()
-    ctx.beginPath(); ctx.moveTo(sx - 13, sy); ctx.lineTo(sx + 13, sy); ctx.moveTo(sx, sy - 13); ctx.lineTo(sx, sy + 13); ctx.stroke()
+
+  if (st.loc?.state !== 'localized') {
+    for (const c of st.loc?.candidates || []) arrow(ctx, c.x, c.y, c.yaw, 'rgba(250,204,21,0.6)', 0.8)
   }
-  if (props.pose) arrow(ctx, props.pose[0], props.pose[1], props.pose[2], '#ffffff', 1.1)
+  if (st.enabled) {
+    polyline(ctx, st.path, '#22c55e', 3)
+    const t = st.target
+    if (t) {
+      const [sx, sy] = w2s(t[0], t[1])
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 3
+      ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI * 2); ctx.stroke()
+      if (t.length > 2) arrow(ctx, t[0], t[1], t[2], '#22c55e', 1.0)
+      else { ctx.beginPath(); ctx.moveTo(sx - 13, sy); ctx.lineTo(sx + 13, sy); ctx.moveTo(sx, sy - 13); ctx.lineTo(sx, sy + 13); ctx.stroke() }
+    }
+  }
+  if (pose) {
+    const [sx, sy] = w2s(pose[0], pose[1])
+    const r = (st.robot_r || 0.31) * view.scale
+    ctx.fillStyle = 'rgba(59,130,246,0.28)'; ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+    arrow(ctx, pose[0], pose[1], pose[2], '#ffffff', Math.max(0.8, Math.min(1.3, r / 14)))
+  }
   if (drag) {
-    const yaw = Math.atan2(drag.cur[1] - drag.start[1], drag.cur[0] - drag.start[0])
-    arrow(ctx, drag.start[0], drag.start[1], yaw, '#60a5fa', 1.3)
+    const color = props.mode === 'goal' ? '#22c55e' : '#a78bfa'
+    if (drag.yaw != null) arrow(ctx, drag.x, drag.y, drag.yaw, color, 1.4, '#fff')
+    else {
+      const [sx, sy] = w2s(drag.x, drag.y)
+      ctx.strokeStyle = color; ctx.lineWidth = 3
+      ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI * 2); ctx.stroke()
+    }
   }
   // 比例尺
   const barM = niceStep(100), barPx = barM * view.scale
@@ -101,7 +154,7 @@ function draw() {
 }
 
 function loop() {
-  if (needDraw && canvasEl.value) { draw(); needDraw = false }
+  if (needDraw && canvasEl.value && W) { draw(); needDraw = false }
   raf = requestAnimationFrame(loop)
 }
 
@@ -118,17 +171,21 @@ function fitAll() {
   const g = props.grid
   if (!g || !W) return
   fitted = true
+  userMoved = false
   follow.value = false
   view.vx = g.x0 + g.w / 2
   view.vy = g.y0 + g.h / 2
   view.scale = Math.min(400, Math.max(2, 0.92 * Math.min(W / g.w, H / g.h)))
   needDraw = true
 }
+// 换了一张地图：重新适配
+watch(() => props.grid && [props.grid.x0, props.grid.y0, props.grid.w, props.grid.h].join(), (a, b) => {
+  if (a && (!fitted || (b && a !== b && !props.state))) fitAll()
+})
 
 // ------------------------------------------------------------------ 交互
 const pointers = new Map()
-let pinchDist = 0
-let downAt = null
+let pinch = null      // 双指：{ dist, mx, my }
 
 function local(e) {
   const r = canvasEl.value.getBoundingClientRect()
@@ -136,6 +193,7 @@ function local(e) {
 }
 
 function zoomAt(f, sx, sy) {
+  userMoved = true
   const s = Math.min(400, Math.max(2, view.scale * f))
   const [wx, wy] = s2w(sx, sy)
   view.scale = s
@@ -149,19 +207,24 @@ function onWheel(e) {
   zoomAt(Math.exp(-e.deltaY * 0.0015), sx, sy)
 }
 
+function pinchInfo() {
+  const [a, b] = [...pointers.values()]
+  const r = canvasEl.value.getBoundingClientRect()
+  return { dist: Math.hypot(a[0] - b[0], a[1] - b[1]), mx: (a[0] + b[0]) / 2 - r.left, my: (a[1] + b[1]) / 2 - r.top }
+}
+
 function onDown(e) {
   canvasEl.value.setPointerCapture(e.pointerId)
   pointers.set(e.pointerId, [e.clientX, e.clientY])
-  downAt = { x: e.clientX, y: e.clientY, t: performance.now() }
   if (pointers.size === 2) {
-    drag = null
-    const [a, b] = [...pointers.values()]
-    pinchDist = Math.hypot(a[0] - b[0], a[1] - b[1])
-  } else if (props.mode === 'reloc') {
-    const w = s2w(...local(e))
-    drag = { start: w, cur: w }
-    needDraw = true
+    drag = null             // 第二根手指落下：这次是缩放 / 平移，不是点选
+    pinch = pinchInfo()
+  } else if (props.mode === 'goal' || props.mode === 'reloc') {
+    const [sx, sy] = local(e)
+    const [x, y] = s2w(sx, sy)
+    drag = { x, y, sx, sy, yaw: null }
   }
+  needDraw = true
 }
 
 function onMove(e) {
@@ -169,46 +232,44 @@ function onMove(e) {
   if (!prev) return
   pointers.set(e.pointerId, [e.clientX, e.clientY])
   if (pointers.size === 2) {
-    const [a, b] = [...pointers.values()]
-    const d = Math.hypot(a[0] - b[0], a[1] - b[1])
-    const r = canvasEl.value.getBoundingClientRect()
-    if (pinchDist) zoomAt(d / pinchDist, (a[0] + b[0]) / 2 - r.left, (a[1] + b[1]) / 2 - r.top)
-    pinchDist = d
+    const p = pinchInfo()
+    if (pinch) {
+      if (!follow.value) { view.vx -= (p.mx - pinch.mx) / view.scale; view.vy += (p.my - pinch.my) / view.scale }
+      zoomAt(p.dist / (pinch.dist || p.dist), p.mx, p.my)
+    }
+    pinch = p
   } else if (drag) {
-    drag.cur = s2w(...local(e))
-    needDraw = true
+    const [sx, sy] = local(e)
+    drag.yaw = Math.hypot(sx - drag.sx, sy - drag.sy) > DRAG_PX ? Math.atan2(-(sy - drag.sy), sx - drag.sx) : null
   } else {
     follow.value = false
+    userMoved = true
     view.vx -= (e.clientX - prev[0]) / view.scale
     view.vy += (e.clientY - prev[1]) / view.scale
-    needDraw = true
   }
+  needDraw = true
 }
 
 function onUp(e) {
   const wasSingle = pointers.size === 1
   pointers.delete(e.pointerId)
-  pinchDist = 0
-  if (!wasSingle) return
-  if (drag) {
-    const d = drag
-    drag = null
-    needDraw = true
-    const len = Math.hypot(d.cur[0] - d.start[0], d.cur[1] - d.start[1])
-    if (len * view.scale < 15) return     // 没拖出朝向：不算
-    emit('pick', { x: d.start[0], y: d.start[1], yaw: Math.atan2(d.cur[1] - d.start[1], d.cur[0] - d.start[0]) })
-    return
-  }
-  // 点一下（几乎没移动）选目标
-  if (props.mode === 'goal' && downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) < 6) {
-    const [x, y] = s2w(...local(e))
-    emit('pick', { x, y })
+  pinch = null
+  needDraw = true
+  if (!wasSingle || !drag) { if (!pointers.size) drag = null; return }
+  const d = drag
+  drag = null
+  if (e.type === 'pointercancel') return
+  if (props.mode === 'reloc') {
+    if (d.yaw == null) return       // 没拖出朝向：不算（手动定位必须给车头方向）
+    emit('pick', { x: d.x, y: d.y, yaw: d.yaw })
+  } else if (props.mode === 'goal') {
+    emit('pick', d.yaw == null ? { x: d.x, y: d.y } : { x: d.x, y: d.y, yaw: d.yaw })
   }
 }
 
 let ro = null
 onMounted(() => {
-  ro = new ResizeObserver(() => { resize(); if (!fitted) fitAll() })
+  ro = new ResizeObserver(() => { resize(); if (!fitted || !userMoved) fitAll() })
   ro.observe(wrapEl.value)
   resize()
   raf = requestAnimationFrame(loop)
@@ -221,7 +282,6 @@ defineExpose({ fitAll })
   <div class="card navmap">
     <div class="bar">
       <span class="title">导航地图</span>
-      <span class="muted legend">白 可通行 · 红 障碍 · 白箭头 机器人 · 绿 目标与路线</span>
       <span class="grow" />
       <label><input v-model="follow" type="checkbox" /> 跟随机器人</label>
       <button @click="fitAll">全图</button>
@@ -230,8 +290,16 @@ defineExpose({ fitAll })
       <canvas ref="canvasEl" @wheel="onWheel" @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp"
               @pointercancel="onUp" />
       <div v-if="!gridUrl" class="hint">选一张导航地图</div>
-      <div v-if="mode === 'goal'" class="tip">点一下地图上的白色区域，机器人会开过去</div>
-      <div v-if="mode === 'reloc'" class="tip">在机器人实际所在处按下，朝车头方向拖动后松开</div>
+      <div v-if="mode === 'goal'" class="tip goal">点一下白色区域选目标；按住拖动可指定到点后的车头朝向 · Esc 取消</div>
+      <div v-if="mode === 'reloc'" class="tip reloc">在机器人实际所在处按下，朝车头方向拖动后松开 · Esc 取消</div>
+      <div class="legend">
+        <span><i class="sw" style="background:rgba(255,255,255,0.55)" />可通行</span>
+        <span><i class="sw" style="background:#ff5050" />障碍</span>
+        <span><i class="sw" style="background:#22d3ee" />实时障碍点</span>
+        <span><i class="sw" style="background:#60a5fa" />机器人</span>
+        <span><i class="sw" style="background:#22c55e" />目标与路线</span>
+        <span><i class="sw dash" />建图轨迹</span>
+      </div>
     </div>
   </div>
 </template>
@@ -240,16 +308,26 @@ defineExpose({ fitAll })
 .navmap { display: flex; flex-direction: column; height: 100%; padding: 12px; gap: 10px; }
 .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }
 .title { font-weight: 600; }
-.legend { font-size: 12px; }
 .grow { flex: 1; }
 label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
 button { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
 .canvas-wrap { position: relative; flex: 1; min-height: 320px; border-radius: 8px; overflow: hidden; background: var(--map-bg); }
+.canvas-wrap.goal { outline: 3px solid #16a34a; }
+.canvas-wrap.reloc { outline: 3px solid #7c3aed; }
 .canvas-wrap.goal canvas, .canvas-wrap.reloc canvas { cursor: crosshair; }
 canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 .hint { position: absolute; inset: 0; display: grid; place-items: center; color: rgba(255, 255, 255, 0.5); pointer-events: none; }
 .tip {
-  position: absolute; left: 50%; top: 10px; transform: translateX(-50%); pointer-events: none;
-  background: rgba(37, 99, 235, 0.9); color: #fff; font-size: 13px; padding: 4px 12px; border-radius: 6px; white-space: nowrap;
+  position: absolute; left: 50%; top: 10px; transform: translateX(-50%); pointer-events: none; max-width: calc(100% - 20px);
+  color: #fff; font-size: 13px; padding: 4px 12px; border-radius: 6px; text-align: center;
 }
+.tip.goal { background: rgba(22, 163, 74, 0.92); }
+.tip.reloc { background: rgba(124, 58, 237, 0.92); }
+.legend {
+  position: absolute; right: 10px; bottom: 10px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end;
+  max-width: calc(100% - 210px); pointer-events: none;
+  font-size: 11px; color: #e5e7eb; background: rgba(0, 0, 0, 0.55); padding: 3px 8px; border-radius: 6px;
+}
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.sw.dash { background: repeating-linear-gradient(90deg, #93aaff 0 4px, transparent 4px 7px); }
 </style>

@@ -9,10 +9,12 @@ const props = defineProps({
   elapsed: { type: Number, default: null },     // status.elapsed_s（从点开始算）
   failed: { type: Boolean, default: false },
   failedMsg: { type: String, default: '' },
+  steps: { type: Array, default: null },        // 另一套步骤（导航页用）：[{ title, hint, typ }]
+  what: { type: String, default: '录制' },
 })
 
 // 与 record.sh cmd_start 的 step 1–6 对应；typ 为大致耗时（s），只用来估计进度条
-const STEPS = [
+const RECORD_STEPS = [
   { title: '读取标定、启动 ROS', hint: '从 Galbot SDK 现读相机外参与关节角', typ: 6 },
   { title: '启动传感器桥接', hint: '连接 Galbot SDK，打开雷达、IMU 与 6 路相机', typ: 7 },
   { title: '等待传感器数据', hint: '雷达、IMU、主相机都出数据', typ: 3 },
@@ -20,6 +22,7 @@ const STEPS = [
   { title: '开始录包与实时地图', hint: '原始数据、轨迹、网页实时地图', typ: 1 },
   { title: '启动自主建图程序', hint: '平时只建 2D 栅格，不动底盘', typ: 1 },
 ]
+const STEPS = props.steps || RECORD_STEPS
 const TOTAL = STEPS.reduce((a, s) => a + s.typ, 0)
 
 const idx = computed(() => {
@@ -51,7 +54,7 @@ const slow = computed(() => !props.failed && stepSec.value > (STEPS[idx.value]?.
 <template>
   <div class="sp" :class="{ failed }">
     <div class="head">
-      <span>{{ failed ? '启动失败' : '正在启动录制' }}</span>
+      <span>{{ failed ? '启动失败' : `正在启动${what}` }}</span>
       <span class="num muted">{{ Math.floor(totalSec) }} s<template v-if="!failed"> / 约 {{ TOTAL }} s</template></span>
     </div>
     <div class="bar"><div class="fill" :style="{ width: (failed ? 100 : pct) + '%' }" /></div>

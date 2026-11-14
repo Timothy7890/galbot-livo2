@@ -2,6 +2,7 @@
 """导航闭环仿真（不需要 ROS、机器人）：真的 navigator.Navigator + 假的 rospy / 传感器 / 底盘。
 
     python3 nav_sim.py <地图目录 nav/> [--start x,y,yaw] [--goal x,y [--goal x,y ...]] [--speed 1]
+    python3 nav_sim.py <地图目录 nav/> --serve     不自动跑目标：开着 7014 接口一直运行，供网页（7010 导航页）联调
 
 假底盘：按 navigator 发出的 (vx, vy, wz) 积分出真实位姿（地图系）；
 假里程计：真实位姿换到一个随机偏移的 odom 系（重定位要自己找出这个偏移），10 Hz；
@@ -96,6 +97,7 @@ def main():
     ap.add_argument("--goal", action="append", default=[])
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--timeout", type=float, default=240.0)
+    ap.add_argument("--serve", action="store_true", help="开 7014 接口一直运行，目标由网页下发")
     a = ap.parse_args()
     SPEED[0] = a.speed
 
@@ -169,6 +171,16 @@ def main():
     threading.Thread(target=nv.plan_loop, daemon=True).start()
     threading.Thread(target=nv.loc_loop, daemon=True).start()
     threading.Thread(target=nv.run, daemon=True).start()
+    if a.serve:
+        navigator.serve(nv)
+        threading.Thread(target=nv.watch_loop, daemon=True).start()
+        print(f"仿真运行中：http://127.0.0.1:{navigator.PORT}/state （Ctrl-C 结束）", flush=True)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            _Shutdown.flag = True
+            return
 
     t_start = time.time()
     ok_all = True

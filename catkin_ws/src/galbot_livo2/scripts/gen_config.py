@@ -84,39 +84,31 @@ def all_sensors(robot, T_b_l, T_b_i):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--camera", default="left_front", choices=list(CAMERAS))
-    ap.add_argument("--out", default=CONFIG_DIR, help="输出目录（默认包内 config/）")
-    ap.add_argument("--overlay", help="保存点云投影图的路径")
-    args = ap.parse_args()
-    cam = CAMERAS[args.camera]
-    os.makedirs(args.out, exist_ok=True)
-
-    robot = open_robot({LIDAR, IMU, *ALL_CAMERAS.values()})
-    try:
-        T_b_l, T_b_i, T_b_c = (pose_in_base(robot, s) for s in (LIDAR, IMU, cam))
-        intr = wait_for(lambda: robot.get_camera_intrinsic(cam))   # 刚初始化时返回空字典
-        lidar = wait_for(lambda: robot.get_lidar_data(LIDAR)) if args.overlay else None
-        jpg = wait_for(lambda: robot.get_rgb_data(cam)) if args.overlay else None
-        sensors = all_sensors(robot, T_b_l, T_b_i)
-    finally:
-        close_robot(robot)
-    with open(os.path.join(args.out, "sensors_all.json"), "w") as f:
-        json.dump(sensors, f, indent=1, ensure_ascii=False)
+def generate(robot, camera, out, with_all=True):
+    """用已经打开的 robot 读外参与主相机内参，写出 out/g1_calib.yaml、camera_g1.yaml（with_all 时另写 sensors_all.json，
+    需要 robot 打开了全部相机）。sdk_bridge.py 在导航启动时直接调用它（~calib_out），省掉单独起一个进程再初始化一遍 SDK。
+    返回 dict：T_b_c、T_i_l、T_c_l、K、sensors。"""
+    cam = CAMERAS[camera]
+    os.makedirs(out, exist_ok=True)
+    T_b_l, T_b_i, T_b_c = (pose_in_base(robot, s) for s in (LIDAR, IMU, cam))
+    intr = wait_for(lambda: robot.get_camera_intrinsic(cam))   # 刚初始化时返回空字典
+    sensors = all_sensors(robot, T_b_l, T_b_i) if with_all else None
+    if sensors is not None:
+        with open(os.path.join(out, "sensors_all.json"), "w") as f:
+            json.dump(sensors, f, indent=1, ensure_ascii=False)
 
     if intr["distortion_model"] != "kannala_brandt" or any(abs(d) > 1e-9 for d in intr["D"]):
-        sys.exit(f"相机模型是 {intr['distortion_model']} D={intr['D']}，本脚本只处理畸变系数全 0 的等距模型")
+        raise RuntimeError(f"相机模型是 {intr['distortion_model']} D={intr['D']}，本脚本只处理畸变系数全 0 的等距模型")
     K = intr["K"]
 
     # FAST-LIVO2 约定：extrinsic_R/T 是雷达在 IMU 系下的位姿；Rcl/Pcl 把雷达系的点变到相机系
     T_i_l = np.linalg.inv(T_b_i) @ T_b_l
     T_c_l = np.linalg.inv(T_b_c) @ T_b_l
 
-    with open(os.path.join(args.out, "g1_calib.yaml"), "w") as f:
+    with open(os.path.join(out, "g1_calib.yaml"), "w") as f:
         f.write(f"""# 由 scripts/gen_config.py 从 Galbot SDK 生成，勿手改
 galbot:
-  main_camera: {args.camera}
+  main_camera: {camera}
   imu_in_base: {fmt(pose7(T_b_i))}   # [x y z qx qy qz qw]，FAST-LIVO2 位姿（IMU）换算到底盘用
 
 extrin_calib:
@@ -125,8 +117,8 @@ extrin_calib:
   Rcl: {fmt(T_c_l[:3, :3])}
   Pcl: {fmt(T_c_l[:3, 3])}
 """)
-    with open(os.path.join(args.out, "camera_g1.yaml"), "w") as f:
-        f.write(f"""# 由 scripts/gen_config.py 从 Galbot SDK 生成，勿手改。{args.camera}，SDK 给出的等距鱼眼模型
+    with open(os.path.join(out, "camera_g1.yaml"), "w") as f:
+        f.write(f"""# 由 scripts/gen_config.py 从 Galbot SDK 生成，勿手改。{camera}，SDK 给出的等距鱼眼模型
 cam_model: EquidistantCamera
 cam_width: {intr['width']}
 cam_height: {intr['height']}
@@ -140,6 +132,28 @@ k2: 0.0
 k3: 0.0
 k4: 0.0
 """)
+    return {"T_b_c": T_b_c, "T_i_l": T_i_l, "T_c_l": T_c_l, "K": K, "sensors": sensors}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--camera", default="left_front", choices=list(CAMERAS))
+    ap.add_argument("--out", default=CONFIG_DIR, help="输出目录（默认包内 config/）")
+    ap.add_argument("--overlay", help="保存点云投影图的路径")
+    args = ap.parse_args()
+    cam = CAMERAS[args.camera]
+
+    robot = open_robot({LIDAR, IMU, *ALL_CAMERAS.values()})
+    try:
+        try:
+            g = generate(robot, args.camera, args.out)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        lidar = wait_for(lambda: robot.get_lidar_data(LIDAR)) if args.overlay else None
+        jpg = wait_for(lambda: robot.get_rgb_data(cam)) if args.overlay else None
+    finally:
+        close_robot(robot)
+    T_b_c, T_i_l, T_c_l, K, sensors = g["T_b_c"], g["T_i_l"], g["T_c_l"], g["K"], g["sensors"]
     print("extrinsic_T", fmt(T_i_l[:3, 3]))
     print("extrinsic_R", fmt(T_i_l[:3, :3]))
     print("Rcl", fmt(T_c_l[:3, :3]))

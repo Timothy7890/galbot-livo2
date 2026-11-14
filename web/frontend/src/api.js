@@ -49,13 +49,31 @@ export async function getNav() {
   const r = await fetch('api/nav')
   return r.json()
 }
-// action：start {session} / stop / goto {x, y} / cancel / reloc {mode, x, y, yaw} / build {session, name}
+// action：start {session, vision, dry_run} / stop / goto {x, y, yaw?} / cancel / reloc {mode, x, y, yaw} / confirm /
+//         speed {v} / heartbeat / build {session, name}
 export async function navAction(action, body) {
-  const r = await fetch(`api/nav/${action}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  })
-  try { return await r.json() } catch { return { ok: false, msg: `HTTP ${r.status}` } }
+  let r
+  try {
+    r = await fetch(`api/nav/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    })
+  } catch (e) {
+    return { ok: false, msg: `连不上 7010 服务：${e.message || e}` }
+  }
+  try {
+    const d = await r.json()
+    if (d.ok === undefined) d.ok = r.ok
+    if (!d.ok && !d.msg) d.msg = d.error || `HTTP ${r.status}`
+    return d
+  } catch {
+    return { ok: false, msg: `服务端返回异常（HTTP ${r.status}），可能代码更新后没重启：web/web.sh restart` }
+  }
 }
 export const navGridUrl = session => (session ? `api/nav/grid.png?session=${session}` : 'api/nav/grid.png')
+export const navStreamUrl = 'api/nav/stream'
+export async function getNavTraj(session) {
+  const r = await fetch(`api/nav/traj?session=${session}`)
+  return r.ok ? r.json() : []
+}
